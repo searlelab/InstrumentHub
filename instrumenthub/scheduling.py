@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -92,12 +92,19 @@ def month_days(year: int, month: int) -> list[date]:
 
 
 def prune_expired_holds(db: Session) -> int:
-    expired = db.scalars(select(Hold).where(Hold.expires_at <= utc_text())).all()
-    for hold in expired:
-        entry = db.get(CalendarEntry, hold.calendar_entry_id)
-        if entry:
-            db.delete(entry)
-    return len(expired)
+    db.flush()
+    result = db.execute(
+        text("""
+            DELETE FROM calendar_entries
+            WHERE id IN (
+                SELECT calendar_entry_id
+                FROM holds
+                WHERE expires_at <= :now
+            )
+        """),
+        {"now": utc_text()},
+    )
+    return result.rowcount
 
 
 def prune_expired_tentatives(db: Session) -> int:

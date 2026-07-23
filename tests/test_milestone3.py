@@ -8,7 +8,7 @@ from threading import Barrier, Event, Thread, current_thread
 from zoneinfo import ZoneInfo
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
 import instrumenthub.booking as booking_module
 from instrumenthub.booking import acquire_hold, configured_slots, release_hold, release_hold_as_admin, submit_booking
@@ -351,6 +351,93 @@ def test_release_racing_with_submission_cannot_delete_confirmed_booking(app, con
         assert booking and entry and entry.entry_type == "booking" and entry.state == "confirmed"
         assert len(rows) == 1 and db.get(Hold, hold_id) is None
         assert not db.scalar(select(AuditEvent.id).where(AuditEvent.action == "released", AuditEvent.entity_type == "hold", AuditEvent.entity_id == str(hold_id)))
+
+
+def test_calendar_prune_racing_with_submission_cannot_delete_confirmed_booking(app, configured, monkeypatch):
+    pi_id, project_id = seed_booking_references(app)
+    slot = future_slot(app, days=38)
+    with app.state.database.session() as db:
+        member = db.scalar(select(User).where(User.username == "member"))
+        hold, token, _ = acquire_hold(db, user=member, instrument_id=2, start_text=slot.start_text, count=1)
+        hold_id, entry_id, member_id = hold.id, hold.calendar_entry_id, member.id
+        live_at = utcnow()
+        hold.expires_at = utc_text(live_at + timedelta(minutes=1))
+
+    clock = {"now": live_at}
+    monkeypatch.setattr("instrumenthub.security.utcnow", lambda: clock["now"])
+    submit_validated = Event()
+    allow_submit = Event()
+    prune_delete_started = Event()
+    original_evaluate = booking_module.evaluate_booking
+
+    def gated_evaluate(*args, **kwargs):
+        if current_thread().name == "submit-booking":
+            submit_validated.set()
+            assert allow_submit.wait(5)
+        return original_evaluate(*args, **kwargs)
+
+    def observe_prune_delete(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if current_thread().name == "calendar-prune" and statement.lstrip().upper().startswith("DELETE FROM CALENDAR_ENTRIES"):
+            prune_delete_started.set()
+
+    monkeypatch.setattr(booking_module, "evaluate_booking", gated_evaluate)
+    event.listen(app.state.database.engine, "before_cursor_execute", observe_prune_delete)
+    outcomes = {}
+
+    def submit():
+        try:
+            with app.state.database.session() as db:
+                booking, _results = submit_booking(
+                    db,
+                    hold_id=hold_id,
+                    token=token,
+                    user=User(id=member_id),
+                    pi_id=pi_id,
+                    project_id=project_id,
+                    grant_id=None,
+                    experiment_code="PRUNE-RACE-SAFE",
+                    expected_minutes=300,
+                    injection_count=None,
+                    gradient_minutes=None,
+                    sample_category="test",
+                )
+                outcomes["booking_id"] = booking.id
+        except Exception as exc:
+            outcomes["submit_error"] = exc
+
+    def render_calendar():
+        try:
+            with app.state.database.session() as db:
+                local_date = slot.start.astimezone(ZoneInfo("America/Chicago")).date()
+                calendar_data(db, 2, local_date.year, local_date.month, "America/Chicago")
+                outcomes["calendar_ok"] = True
+        except Exception as exc:
+            outcomes["calendar_error"] = exc
+
+    submit_thread = Thread(target=submit, name="submit-booking")
+    calendar_thread = Thread(target=render_calendar, name="calendar-prune")
+    try:
+        submit_thread.start()
+        assert submit_validated.wait(5)
+        clock["now"] = live_at + timedelta(minutes=2)
+        calendar_thread.start()
+        assert prune_delete_started.wait(5)
+        allow_submit.set()
+        submit_thread.join(10); calendar_thread.join(10)
+    finally:
+        allow_submit.set()
+        submit_thread.join(10); calendar_thread.join(10)
+        event.remove(app.state.database.engine, "before_cursor_execute", observe_prune_delete)
+
+    assert not submit_thread.is_alive() and not calendar_thread.is_alive()
+    assert "submit_error" not in outcomes and outcomes.get("booking_id")
+    assert "calendar_error" not in outcomes and outcomes.get("calendar_ok")
+    with app.state.database.session() as db:
+        booking = db.scalar(select(Booking).where(Booking.calendar_entry_id == entry_id))
+        entry_row = db.get(CalendarEntry, entry_id)
+        rows = db.scalars(select(ReservedSlot).where(ReservedSlot.calendar_entry_id == entry_id)).all()
+        assert booking and entry_row and entry_row.entry_type == "booking" and entry_row.state == "confirmed"
+        assert len(rows) == 1 and db.get(Hold, hold_id) is None
 
 
 def test_admin_can_view_and_release_member_hold(client, configured, app):
