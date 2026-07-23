@@ -60,7 +60,13 @@ def create_session(db: Session, user: User, settings: Settings) -> tuple[str, Se
     return token, record
 
 
-def resolve_session(db: Session, token: str | None, settings: Settings) -> tuple[User, SessionRecord] | None:
+def resolve_session(
+    db: Session,
+    token: str | None,
+    settings: Settings,
+    *,
+    refresh_idle_activity: bool = True,
+) -> tuple[User, SessionRecord] | None:
     if not token:
         return None
     record = db.scalar(select(SessionRecord).where(SessionRecord.token_hash == hash_token(token)))
@@ -74,7 +80,8 @@ def resolve_session(db: Session, token: str | None, settings: Settings) -> tuple
     if not user or not user.active:
         record.revoked_at = utc_text(now)
         return None
-    record.last_seen_at = utc_text(now)
+    if refresh_idle_activity:
+        record.last_seen_at = utc_text(now)
     return user, record
 
 

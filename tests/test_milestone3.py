@@ -4,12 +4,14 @@ import json
 import re
 from datetime import UTC, date, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event, Thread, current_thread
 from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import func, select
 
-from instrumenthub.booking import acquire_hold, configured_slots, submit_booking
+import instrumenthub.booking as booking_module
+from instrumenthub.booking import acquire_hold, configured_slots, release_hold, release_hold_as_admin, submit_booking
 from instrumenthub.models import Allotment, AppSetting, AuditEvent, Booking, CalendarEntry, Grant, Hold, Instrument, InstrumentTraining, PI, Project, ProjectGrant, ReservedSlot, SessionRecord, User, UserProject
 from instrumenthub.rules import allotment_balances, estimate_duration_minutes, evaluate_booking, overall_result
 from instrumenthub.scheduling import calendar_data, prune_expired_holds, slots_for_date
@@ -182,6 +184,9 @@ def test_hold_to_confirmed_booking_and_contact_detail(client, configured, app):
     held = client.post("/book/hold", data={"csrf_token": csrf, "instrument_id": "2", "slot_start": slot.start_text, "count": "1"}, follow_redirects=False)
     assert held.status_code == 303
     hold_id = int(held.headers["location"].split("/")[-1])
+    with app.state.database.session() as db:
+        session = db.scalar(select(SessionRecord).where(SessionRecord.user_id == 2, SessionRecord.revoked_at.is_(None)))
+        session.wizard_json = json.dumps({"experiment_code": "stale experiment"})
     result = client.post("/book/submit", data={"csrf_token": csrf, "hold_id": hold_id, "instrument_id": "2", "pi_id": pi_id, "project_id": project_id, "experiment_code": "EXP-1", "expected_minutes": "300", "sample_category": "cells"}, follow_redirects=False)
     assert result.status_code == 303
     detail = client.get(result.headers["location"])
@@ -191,6 +196,188 @@ def test_hold_to_confirmed_booking_and_contact_detail(client, configured, app):
     with app.state.database.session() as db:
         entry = db.scalar(select(CalendarEntry).where(CalendarEntry.title == "EXP-1"))
         assert entry.state == "confirmed"
+        session = db.scalar(select(SessionRecord).where(SessionRecord.user_id == 2, SessionRecord.revoked_at.is_(None)))
+        assert json.loads(session.wizard_json) == {}
+
+
+def test_new_hold_atomically_supersedes_same_user_hold_on_same_instrument(app, configured):
+    target = date.today() + timedelta(days=31)
+    with app.state.database.session() as db:
+        user = db.scalar(select(User).where(User.username == "member"))
+        slots = slots_for_date(db, 2, target, "America/Chicago")
+        first, _first_token, _ = acquire_hold(db, user=user, instrument_id=2, start_text=slots[0].start_text, count=1)
+        first_id, first_entry_id, first_start = first.id, first.calendar_entry_id, slots[0].start_text
+    with app.state.database.session() as db:
+        user = db.scalar(select(User).where(User.username == "member"))
+        second, _second_token, _ = acquire_hold(db, user=user, instrument_id=2, start_text=slots[1].start_text, count=1)
+        second_id = second.id
+    with app.state.database.session() as db:
+        assert db.get(Hold, second_id) is not None
+        assert db.scalar(select(func.count()).select_from(Hold).where(Hold.user_id == 2)) == 1
+        assert db.scalar(select(ReservedSlot.id).where(ReservedSlot.slot_start == first_start)) is None
+        assert db.scalar(select(ReservedSlot.id).where(ReservedSlot.slot_start == slots[1].start_text)) is not None
+        assert db.scalar(select(AuditEvent.id).where(AuditEvent.action == "superseded", AuditEvent.entity_id == str(first_id)))
+
+
+def test_failed_hold_replacement_rolls_back_and_preserves_prior_hold(app, configured):
+    target = date.today() + timedelta(days=32)
+    with app.state.database.session() as db:
+        member = db.scalar(select(User).where(User.username == "member"))
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        slots = slots_for_date(db, 2, target, "America/Chicago")
+        original, _token, _ = acquire_hold(db, user=member, instrument_id=2, start_text=slots[0].start_text, count=1)
+        blocked, _blocked_token, _ = acquire_hold(db, user=admin, instrument_id=2, start_text=slots[1].start_text, count=1)
+        original_id, blocked_id = original.id, blocked.id
+    with pytest.raises(ValueError, match="no longer available"):
+        with app.state.database.session() as db:
+            member = db.scalar(select(User).where(User.username == "member"))
+            acquire_hold(db, user=member, instrument_id=2, start_text=slots[1].start_text, count=1)
+    with app.state.database.session() as db:
+        assert db.get(Hold, original_id) is not None and db.get(Hold, blocked_id) is not None
+
+
+def test_user_can_hold_once_on_each_instrument(app, configured):
+    with app.state.database.session() as db:
+        user = db.scalar(select(User).where(User.username == "member"))
+        first_slot = slots_for_date(db, 1, date.today() + timedelta(days=33), "America/Chicago")[0]
+        second_slot = slots_for_date(db, 2, date.today() + timedelta(days=33), "America/Chicago")[0]
+        acquire_hold(db, user=user, instrument_id=1, start_text=first_slot.start_text, count=1)
+        acquire_hold(db, user=user, instrument_id=2, start_text=second_slot.start_text, count=1)
+    with app.state.database.session() as db:
+        assert db.scalar(select(func.count()).select_from(Hold).where(Hold.user_id == 2)) == 2
+
+
+def test_concurrent_same_user_holds_leave_one_live_hold(app, configured):
+    with app.state.database.session() as db:
+        slots = slots_for_date(db, 2, date.today() + timedelta(days=34), "America/Chicago")
+        member_id = db.scalar(select(User.id).where(User.username == "member"))
+    barrier = Barrier(2)
+
+    def acquire(slot):
+        barrier.wait()
+        with app.state.database.session() as db:
+            assert not db.in_transaction()
+            user = User(id=member_id)
+            hold, _token, _ = acquire_hold(db, user=user, instrument_id=2, start_text=slot.start_text, count=1)
+            return hold.id
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ids = list(pool.map(acquire, slots[:2]))
+    assert len(ids) == 2
+    with app.state.database.session() as db:
+        assert db.scalar(select(func.count()).select_from(Hold).where(Hold.user_id == 2)) == 1
+
+
+@pytest.mark.parametrize("release_kind", ["admin", "member"])
+def test_release_racing_with_submission_cannot_delete_confirmed_booking(app, configured, monkeypatch, release_kind):
+    pi_id, project_id = seed_booking_references(app)
+    slot = future_slot(app, days=37)
+    with app.state.database.session() as db:
+        member = db.scalar(select(User).where(User.username == "member"))
+        hold, token, _ = acquire_hold(db, user=member, instrument_id=2, start_text=slot.start_text, count=1)
+        hold_id, entry_id, member_id = hold.id, hold.calendar_entry_id, member.id
+
+    submit_locked = Event()
+    allow_submit = Event()
+    release_attempting_lock = Event()
+    original_resolve_hold = booking_module.resolve_hold
+    original_serialize = booking_module._serialize_hold_write
+
+    def gated_resolve_hold(*args, **kwargs):
+        if current_thread().name == "submit-booking":
+            submit_locked.set()
+            assert allow_submit.wait(5)
+        return original_resolve_hold(*args, **kwargs)
+
+    def observed_serialize(db):
+        if current_thread().name == "release-hold":
+            release_attempting_lock.set()
+        return original_serialize(db)
+
+    monkeypatch.setattr(booking_module, "resolve_hold", gated_resolve_hold)
+    monkeypatch.setattr(booking_module, "_serialize_hold_write", observed_serialize)
+    outcomes = {}
+
+    def submit():
+        try:
+            with app.state.database.session() as db:
+                booking, _results = submit_booking(
+                    db,
+                    hold_id=hold_id,
+                    token=token,
+                    user=User(id=member_id),
+                    pi_id=pi_id,
+                    project_id=project_id,
+                    grant_id=None,
+                    experiment_code="RACE-SAFE",
+                    expected_minutes=300,
+                    injection_count=None,
+                    gradient_minutes=None,
+                    sample_category="test",
+                )
+                outcomes["booking_id"] = booking.id
+        except Exception as exc:
+            outcomes["submit_error"] = exc
+
+    def release():
+        try:
+            with app.state.database.session() as db:
+                if release_kind == "admin":
+                    release_hold_as_admin(db, hold_id=hold_id, admin_id=1, reason="Concurrent release")
+                else:
+                    release_hold(db, hold_id=hold_id, tokens=[token], user_id=member_id)
+                outcomes["released"] = True
+        except Exception as exc:
+            outcomes["release_error"] = exc
+
+    submit_thread = Thread(target=submit, name="submit-booking")
+    release_thread = Thread(target=release, name="release-hold")
+    submit_thread.start()
+    assert submit_locked.wait(5)
+    release_thread.start()
+    assert release_attempting_lock.wait(5)
+    allow_submit.set()
+    submit_thread.join(10); release_thread.join(10)
+    assert not submit_thread.is_alive() and not release_thread.is_alive()
+    assert "submit_error" not in outcomes and outcomes.get("booking_id")
+    assert isinstance(outcomes.get("release_error"), ValueError)
+    expected_error = "not found or already expired" if release_kind == "admin" else "missing, expired"
+    assert expected_error in str(outcomes["release_error"])
+    assert "released" not in outcomes
+    with app.state.database.session() as db:
+        booking = db.scalar(select(Booking).where(Booking.calendar_entry_id == entry_id))
+        entry = db.get(CalendarEntry, entry_id)
+        rows = db.scalars(select(ReservedSlot).where(ReservedSlot.calendar_entry_id == entry_id)).all()
+        assert booking and entry and entry.entry_type == "booking" and entry.state == "confirmed"
+        assert len(rows) == 1 and db.get(Hold, hold_id) is None
+        assert not db.scalar(select(AuditEvent.id).where(AuditEvent.action == "released", AuditEvent.entity_type == "hold", AuditEvent.entity_id == str(hold_id)))
+
+
+def test_admin_can_view_and_release_member_hold(client, configured, app):
+    with app.state.database.session() as db:
+        member = db.scalar(select(User).where(User.username == "member"))
+        slot = slots_for_date(db, 2, date.today() + timedelta(days=35), "America/Chicago")[0]
+        hold, _token, _ = acquire_hold(db, user=member, instrument_id=2, start_text=slot.start_text, count=1)
+        hold_id, entry_id = hold.id, hold.calendar_entry_id
+    page = client.get("/admin/schedule")
+    assert "Live booking holds" in page.text and "Lab Member" in page.text
+    response = client.post(f"/admin/holds/{hold_id}/release", data={"csrf_token": configured, "reason": "User abandoned wizard"}, follow_redirects=False)
+    assert response.status_code == 303
+    with app.state.database.session() as db:
+        assert db.get(Hold, hold_id) is None and db.get(CalendarEntry, entry_id) is None
+        event = db.scalar(select(AuditEvent).where(AuditEvent.action == "released", AuditEvent.entity_id == str(hold_id)))
+        assert event.actor_user_id == 1 and event.reason == "User abandoned wizard"
+
+
+def test_hold_error_uses_configured_duration(client, configured, app):
+    with app.state.database.session() as db:
+        db.get(AppSetting, "hold_minutes").value = "7"
+        member = db.scalar(select(User).where(User.username == "member"))
+        slot = slots_for_date(db, 2, date.today() + timedelta(days=36), "America/Chicago")[0]
+        acquire_hold(db, user=member, instrument_id=2, start_text=slot.start_text, count=1)
+    response = client.post("/book/hold", data={"csrf_token": configured, "instrument_id": "2", "slot_start": slot.start_text, "count": "1"})
+    assert response.status_code == 409
+    assert "held for 7 minutes" in response.text
 
 
 def test_booking_wizard_has_live_duration_rules_and_allotment_balances(client, configured, app):

@@ -67,6 +67,62 @@ def test_invalid_lifecycle_transition_is_rejected(app, configured):
             transition_booking(db, booking_id=booking_id, new_state="completed", admin_id=admin.id, reason="Invalid shortcut")
 
 
+@pytest.mark.parametrize("state", ["active", "paused"])
+def test_active_and_paused_bookings_require_explicit_transition_before_reschedule(app, configured, state):
+    booking_id, entry_id, _ = make_booking(app, days=62)
+    with app.state.database.session() as db:
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        entry = db.get(CalendarEntry, entry_id)
+        entry.state = state
+        target = slots_for_date(db, 2, date.today() + timedelta(days=63), "America/Chicago")[0]
+        with pytest.raises(ValueError, match="explicit lifecycle transitions"):
+            edit_booking(
+                db,
+                booking_id=booking_id,
+                actor=admin,
+                experiment_code="NO-IMPLICIT-DEMOTION",
+                expected_minutes=300,
+                sample_category="test",
+                description="",
+                admin_notes="",
+                new_start=target.start_text,
+                reason="Attempted move",
+            )
+        assert entry.state == state
+
+
+def test_outage_paused_booking_cannot_resume_before_instrument_recovery(app, configured):
+    booking_id, entry_id, _ = make_booking(app, days=64)
+    outage_date = date.today() + timedelta(days=64)
+    with app.state.database.session() as db:
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        outage = preview_outage(db, instrument_id=2, start_date=outage_date, end_date=None, reason="Fault", admin_id=admin.id)
+        apply_schedule_draft(db, draft_id=outage.id, admin_id=admin.id)
+    with app.state.database.session() as db:
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        with pytest.raises(ValueError, match=f"Booking {booking_id}.*unresolved outage"):
+            transition_booking(db, booking_id=booking_id, new_state="active", admin_id=admin.id, reason="Premature resume")
+        assert db.get(CalendarEntry, entry_id).state == "paused"
+        resume = preview_resume(db, instrument_id=2, restart_date=outage_date + timedelta(days=2), admin_id=admin.id, reason="Repaired")
+        assert resume.kind == "resume"
+
+
+def test_resume_reconciliation_names_the_booking_with_an_invalid_state(app, configured):
+    booking_id, entry_id, _ = make_booking(app, days=65)
+    outage_date = date.today() + timedelta(days=65)
+    with app.state.database.session() as db:
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        outage = preview_outage(db, instrument_id=2, start_date=outage_date, end_date=None, reason="Fault", admin_id=admin.id)
+        apply_schedule_draft(db, draft_id=outage.id, admin_id=admin.id)
+    with app.state.database.session() as db:
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        entry = db.get(CalendarEntry, entry_id)
+        entry.state = "active"
+        with pytest.raises(ValueError, match=f"Schedule entry {entry_id}.*OPS-65.*state 'active'"):
+            preview_resume(db, instrument_id=2, restart_date=outage_date + timedelta(days=2), admin_id=admin.id, reason="Repaired")
+        assert db.get(Booking, booking_id).queue_order is not None
+
+
 @pytest.mark.parametrize("initial_state", ["tentative", "confirmed", "paused"])
 def test_every_lifecycle_cancellation_path_releases_reserved_slots(app, configured, initial_state):
     booking_id, entry_id, _ = make_booking(app, days=11)
@@ -576,6 +632,23 @@ def test_schedule_apply_acquires_immediate_transaction_before_admin_lookup(app, 
     assert seen_transaction_states == [True]
 
 
+def test_unknown_outage_recovery_acquires_immediate_transaction_before_admin_lookup(app, configured, monkeypatch):
+    import instrumenthub.management as management
+
+    seen_transaction_states = []
+    original = management.require_active_admin
+
+    def recording_require_active_admin(db, admin_id):
+        seen_transaction_states.append(db.in_transaction())
+        return original(db, admin_id)
+
+    monkeypatch.setattr(management, "require_active_admin", recording_require_active_admin)
+    with app.state.database.session() as db:
+        with pytest.raises(ValueError, match="unresolved outage"):
+            management.recover_unknown_outage(db, instrument_id=2, admin_id=1, reason="Probe")
+    assert seen_transaction_states == [True]
+
+
 def test_outage_starts_after_completed_work_on_its_first_date(app, configured):
     _booking_id, entry_id, _ = make_booking(app, days=27)
     outage_date = date.today() + timedelta(days=27)
@@ -737,6 +810,9 @@ def test_unresolved_outage_blocks_block_changes_and_has_audited_recovery(app, co
         outage_id = outage.id
     with app.state.database.session() as db:
         apply_schedule_draft(db, draft_id=outage_id, admin_id=admin.id)
+        outage_entry = db.scalar(select(CalendarEntry).join(Maintenance, Maintenance.calendar_entry_id == CalendarEntry.id).where(CalendarEntry.entry_type == "outage", Maintenance.known_duration.is_(False)))
+        outage_entry_id = outage_entry.id
+        assert db.scalar(select(func.count()).select_from(ReservedSlot).where(ReservedSlot.calendar_entry_id == outage_entry_id)) > 0
     with app.state.database.session() as db:
         admin = db.scalar(select(User).where(User.username == "admin"))
         from instrumenthub.services import replace_block_definitions
@@ -748,6 +824,18 @@ def test_unresolved_outage_blocks_block_changes_and_has_audited_recovery(app, co
         assert db.get(CalendarEntry, entry_id).state == "canceled"
         booking = db.get(Booking, booking_id)
         assert booking and booking.queue_order is None and booking.pre_pause_state is None
+        assert db.get(CalendarEntry, outage_entry_id).state == "canceled"
+        assert db.scalar(select(func.count()).select_from(ReservedSlot).where(ReservedSlot.calendar_entry_id == outage_entry_id)) == 0
+        assert db.scalar(select(AuditEvent.id).where(AuditEvent.action == "canceled", AuditEvent.entity_type == "outage", AuditEvent.entity_id == str(outage_entry_id)))
+
+
+def test_missing_booking_transition_returns_conflict(client, configured):
+    response = client.post(
+        "/admin/bookings/999999/transition",
+        data={"csrf_token": configured, "new_state": "active", "reason": "Missing record"},
+    )
+    assert response.status_code == 409
+    assert "Booking not found" in response.text
 
 
 def test_known_outage_handles_a_booking_more_than_120_days_ahead(app, configured):

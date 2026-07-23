@@ -2,7 +2,8 @@ param(
   [Parameter(Mandatory=$true)][string]$ReleaseDirectory,
   [string]$InstallDirectory = "C:\Program Files\InstrumentHub",
   [string]$DataDirectory = "C:\ProgramData\InstrumentHub",
-  [string]$ServiceAccount = "NT AUTHORITY\LocalService"
+  [string]$ServiceAccount = "NT AUTHORITY\LocalService",
+  [ValidateRange(1,3650)][int]$BackupRetentionDays = 30
 )
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\common.ps1"
@@ -64,7 +65,7 @@ Invoke-Native "$InstallDirectory\InstrumentHub.exe" @("install")
 Invoke-Native "$InstallDirectory\InstrumentHubCaddy.exe" @("install")
 Invoke-Native "$InstallDirectory\InstrumentHub.exe" @("start")
 Invoke-Native "$InstallDirectory\InstrumentHubCaddy.exe" @("start")
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$InstallDirectory\deploy\windows\backup.ps1`" -InstallDirectory `"$InstallDirectory`" -DataDirectory `"$DataDirectory`""
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$InstallDirectory\deploy\windows\backup.ps1`" -InstallDirectory `"$InstallDirectory`" -DataDirectory `"$DataDirectory`" -RetentionDays $BackupRetentionDays"
 $trigger = New-ScheduledTaskTrigger -Daily -At 2am
 Register-ScheduledTask -TaskName "InstrumentHub Daily Backup" -Action $action -Trigger $trigger -User "SYSTEM" -RunLevel Highest -Force | Out-Null
 Write-Host "Installed. Run the bootstrap-admin command interactively, then complete setup over HTTPS."

@@ -43,10 +43,10 @@ from .models import (
     UserProject,
 )
 from .security import cleanup_login_attempts, cleanup_sessions, create_session, hash_token, parse_utc, resolve_session, revoke_user_sessions, utc_text, utcnow, verify_password
-from .services import audit, complete_setup, create_user, replace_block_definitions, setup_complete
+from .services import audit, complete_setup, create_user, replace_block_definitions, reset_user_password, setup_complete
 from .services import get_setting
-from .scheduling import calendar_data, create_maintenance, month_days
-from .booking import acquire_hold, resolve_hold, save_wizard_state, slot_values, submit_booking
+from .scheduling import calendar_data, create_maintenance, month_days, prune_expired_holds
+from .booking import acquire_hold, clear_wizard_state, release_hold, release_hold_as_admin, resolve_hold, save_wizard_state, slot_values, submit_booking
 from .rules import RuleResult, allotment_balances, evaluate_booking, estimate_duration_minutes
 from .management import apply_schedule_draft, cancel_booking, decide_booking, edit_booking, owner_can_manage_booking, preview_outage, preview_resume, recover_unknown_outage, transition_booking
 from .logging_config import configure_logging
@@ -145,18 +145,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request.state.csrf_token = ""
         try:
             with database.session() as db:
-                resolved = resolve_session(db, request.cookies.get("instrumenthub_session"), settings)
+                resolved = resolve_session(
+                    db,
+                    request.cookies.get("instrumenthub_session"),
+                    settings,
+                    refresh_idle_activity=request.url.path != "/api/calendar",
+                )
                 if resolved:
                     user, session_record = resolved
                     request.state.user = _request_user(user)
                     request.state.csrf_token = session_record.csrf_token
+            response = await call_next(request)
         except Exception:
             request.state.user = None
             request.state.csrf_token = ""
-            LOGGER.exception("Unable to resolve request session", extra={"request_id": request.state.request_id})
+            LOGGER.exception("Unhandled request error", extra={"request_id": request.state.request_id})
             response = templates.TemplateResponse(request, "error.html", _context(request, status=500, message="An unexpected error occurred. The request identifier is shown below."), status_code=500)
-        else:
-            response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "same-origin"
@@ -401,6 +405,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             audit(db, "role_changed", "user", target.id, actor_user_id=admin.id, reason=reason, before={"role": before}, after={"role": role}, request_id=request.state.request_id)
         return _redirect("/admin?message=User+role+updated")
 
+    @app.post("/admin/users/{user_id}/password")
+    def admin_user_password(
+        request: Request,
+        user_id: int,
+        csrf_token: Annotated[str, Form()],
+        new_password: Annotated[str, Form()],
+        new_password_confirmation: Annotated[str, Form()],
+        reason: Annotated[str, Form()],
+    ):
+        admin = _require_admin(request); _check_csrf(request, csrf_token)
+        if new_password != new_password_confirmation:
+            raise HTTPException(400, "New passwords do not match.")
+        try:
+            with database.session() as db:
+                reset_user_password(
+                    db,
+                    target_user_id=user_id,
+                    new_password=new_password,
+                    actor_user_id=admin.id,
+                    reason=reason,
+                    request_id=request.state.request_id,
+                )
+        except ValueError as exc:
+            status_code = 404 if str(exc) == "User not found." else 400
+            raise HTTPException(status_code, str(exc)) from exc
+        if user_id == admin.id:
+            response = _redirect("/login")
+            response.delete_cookie("instrumenthub_session", path="/")
+            return response
+        return _redirect("/admin?message=Password+reset+and+sessions+revoked")
+
     @app.post("/admin/references/{reference_type}/{reference_id}/status")
     def admin_reference_status(request: Request, reference_type: str, reference_id: int, csrf_token: Annotated[str, Form()], active: Annotated[str, Form()], reason: Annotated[str, Form()]):
         admin = _require_admin(request); _check_csrf(request, csrf_token)
@@ -643,7 +678,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 hold, token, _slots = acquire_hold(db, user=user, instrument_id=instrument_id, start_text=slot_start, count=count, request_id=request.state.request_id)
                 hold_id = hold.id
         except ValueError as exc:
-            return templates.TemplateResponse(request, "booking_select.html", _context(request, instrument_id=instrument_id, slot_start=slot_start, hold_minutes=15, error=str(exc)), status_code=409)
+            with database.session() as db:
+                hold_minutes = get_setting(db, "hold_minutes", "15")
+            return templates.TemplateResponse(request, "booking_select.html", _context(request, instrument_id=instrument_id, slot_start=slot_start, hold_minutes=hold_minutes, error=str(exc)), status_code=409)
         response = _redirect(f"/book/{hold_id}")
         response.set_cookie(_hold_cookie(instrument_id), token, httponly=True, secure=settings.secure_cookies, samesite="lax", max_age=3600, path="/")
         return response
@@ -687,6 +724,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     raise ValueError("The selected instrument is unavailable.")
                 token = request.cookies.get(_hold_cookie(selected_instrument_id), "")
                 booking, _results = submit_booking(db, hold_id=hold_id, token=token, user=user, pi_id=pi_id, project_id=project_id, grant_id=int(grant_id) if grant_id else None, experiment_code=experiment_code, expected_minutes=int(expected_minutes) if expected_minutes else None, injection_count=int(injection_count) if injection_count else None, gradient_minutes=int(gradient_minutes) if gradient_minutes else None, sample_category=sample_category, description=description, admin_notes=admin_notes, override_required=bool(override_required), request_id=request.state.request_id, expected_instrument_id=selected_instrument_id)
+                clear_wizard_state(db, request.cookies.get("instrumenthub_session"))
                 entry_id = booking.calendar_entry_id
         except (ValueError, TypeError, IndexError) as exc:
             with database.session() as db:
@@ -728,10 +766,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user = _require_user(request); _check_csrf(request, request.headers.get("X-CSRF-Token", ""))
         try:
             with database.session() as db:
-                hold, entry, _slots = resolve_hold(db, hold_id=hold_id, token=_hold_token(request, db, hold_id), user_id=user.id)
-                instrument_id = entry.instrument_id
-                db.delete(entry)
-                audit(db, "released", "hold", hold.id, actor_user_id=user.id, request_id=request.state.request_id)
+                tokens = [value for name, value in request.cookies.items() if name.startswith("instrumenthub_hold_")]
+                instrument_id = release_hold(db, hold_id=hold_id, tokens=tokens, user_id=user.id, request_id=request.state.request_id)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         response = Response(status_code=204)
@@ -803,7 +839,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def schedule_admin_page(request: Request, message: str = ""):
         _require_admin(request)
         with database.session() as db:
+            prune_expired_holds(db)
             tentative = [(booking, entry, db.get(User, booking.user_id)) for booking, entry in db.execute(select(Booking, CalendarEntry).join(CalendarEntry, CalendarEntry.id == Booking.calendar_entry_id).where(CalendarEntry.state == "tentative")).all()]
+            live_holds = db.execute(
+                select(Hold, CalendarEntry, User, Instrument)
+                .join(CalendarEntry, CalendarEntry.id == Hold.calendar_entry_id)
+                .join(User, User.id == Hold.user_id)
+                .join(Instrument, Instrument.id == CalendarEntry.instrument_id)
+                .order_by(Hold.expires_at, Hold.id)
+            ).all()
             draft_views = []
             for draft in db.scalars(select(ScheduleChangeDraft).order_by(ScheduleChangeDraft.id.desc())):
                 payload = json.loads(draft.payload_json)
@@ -812,8 +856,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     entry = db.get(CalendarEntry, item["entry_id"])
                     items.append({**item, "title": entry.title if entry else f"Entry {item['entry_id']}", "entry_type": entry.entry_type if entry else "unknown"})
                 draft_views.append(SimpleNamespace(draft=draft, outage_slots=payload.get("outage_slots", []), restart_at=payload.get("restart_at"), items=items))
-            values = dict(tentative=tentative, instruments=db.scalars(select(Instrument).where(Instrument.active.is_(True)).order_by(Instrument.name)).all(), draft_views=draft_views, audits=db.scalars(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(100)).all(), message=message)
+            values = dict(tentative=tentative, live_holds=live_holds, instruments=db.scalars(select(Instrument).where(Instrument.active.is_(True)).order_by(Instrument.name)).all(), draft_views=draft_views, audits=db.scalars(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(100)).all(), message=message)
         return templates.TemplateResponse(request, "admin_schedule.html", _context(request, **values))
+
+    @app.post("/admin/holds/{hold_id}/release")
+    def admin_hold_release(request: Request, hold_id: int, csrf_token: Annotated[str, Form()], reason: Annotated[str, Form()]):
+        admin = _require_admin(request); _check_csrf(request, csrf_token)
+        try:
+            with database.session() as db:
+                release_hold_as_admin(db, hold_id=hold_id, admin_id=admin.id, reason=reason, request_id=request.state.request_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return _redirect("/admin/schedule?message=Hold+released")
 
     @app.post("/admin/bookings/{booking_id}/decision")
     def booking_decision(request: Request, booking_id: int, csrf_token: Annotated[str, Form()], decision: Annotated[str, Form()], reason: Annotated[str, Form()]):
@@ -827,9 +881,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def booking_transition(request: Request, booking_id: int, csrf_token: Annotated[str, Form()], new_state: Annotated[str, Form()], reason: Annotated[str, Form()]):
         admin = _require_admin(request); _check_csrf(request, csrf_token)
         try:
-            with database.session() as db: transition_booking(db, booking_id=booking_id, new_state=new_state, admin_id=admin.id, reason=reason, request_id=request.state.request_id)
+            with database.session() as db: entry_id = transition_booking(db, booking_id=booking_id, new_state=new_state, admin_id=admin.id, reason=reason, request_id=request.state.request_id)
         except ValueError as exc: raise HTTPException(409, str(exc)) from exc
-        with database.session() as db: entry_id = db.get(Booking, booking_id).calendar_entry_id
         return _redirect(f"/entries/{entry_id}")
 
     @app.post("/admin/outages/preview")

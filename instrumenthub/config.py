@@ -19,6 +19,13 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         instance = Path(os.environ.get("INSTRUMENTHUB_INSTANCE", "instance")).resolve()
+        retention_text = os.environ.get("INSTRUMENTHUB_BACKUP_RETENTION_DAYS", "30")
+        try:
+            backup_retention_days = int(retention_text)
+        except ValueError as exc:
+            raise ValueError("INSTRUMENTHUB_BACKUP_RETENTION_DAYS must be an integer from 1 through 3650.") from exc
+        if not 1 <= backup_retention_days <= 3650:
+            raise ValueError("INSTRUMENTHUB_BACKUP_RETENTION_DAYS must be from 1 through 3650.")
         return cls(
             instance_dir=instance,
             database_path=Path(os.environ.get("INSTRUMENTHUB_DATABASE", instance / "instrumenthub.sqlite3")).resolve(),
@@ -27,7 +34,7 @@ class Settings:
             secure_cookies=os.environ.get("INSTRUMENTHUB_SECURE_COOKIES", "true").lower() not in {"0", "false", "no"},
             session_idle_minutes=int(os.environ.get("INSTRUMENTHUB_SESSION_IDLE_MINUTES", "480")),
             session_absolute_hours=int(os.environ.get("INSTRUMENTHUB_SESSION_ABSOLUTE_HOURS", "24")),
-            backup_retention_days=int(os.environ.get("INSTRUMENTHUB_BACKUP_RETENTION_DAYS", "30")),
+            backup_retention_days=backup_retention_days,
         )
 
     def ensure_directories(self) -> None:
@@ -35,4 +42,3 @@ class Settings:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.backup_dir.mkdir(parents=True, exist_ok=True)
-

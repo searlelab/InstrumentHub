@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .models import AppSetting, AuditEvent, BlockDefinition, Booking, CalendarEntry, Instrument, ReservedSlot, User
-from .security import hash_password, parse_utc, utc_text
+from .security import hash_password, parse_utc, revoke_user_sessions, utc_text
 
 SENSITIVE_KEYS = {"password", "password_hash", "token", "token_hash", "csrf", "csrf_token", "secret"}
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]{3,64}$")
@@ -101,6 +101,63 @@ def create_user(
     db.flush()
     audit(db, "created", "user", user.id, actor_user_id=actor_user_id, after={"username": username, "role": role}, request_id=request_id)
     return user
+
+
+def reset_user_password(
+    db: Session,
+    *,
+    target_user_id: int,
+    new_password: str,
+    actor_user_id: int,
+    reason: str,
+    request_id: str = "",
+) -> User:
+    require_active_admin(db, actor_user_id)
+    if not reason.strip():
+        raise ValueError("A password-reset reason is required.")
+    target = db.get(User, target_user_id)
+    if not target:
+        raise ValueError("User not found.")
+    target.password_hash = hash_password(new_password)
+    revoke_user_sessions(db, target.id)
+    audit(
+        db,
+        "password_reset",
+        "user",
+        target.id,
+        actor_user_id=actor_user_id,
+        reason=reason,
+        after={"sessions_revoked": True},
+        request_id=request_id,
+    )
+    return target
+
+
+def break_glass_reset_admin_password(
+    db: Session,
+    *,
+    username: str,
+    new_password: str,
+) -> User:
+    target = db.scalar(select(User).where(func.lower(User.username) == username.strip().lower()))
+    if not target:
+        raise ValueError("Administrator account not found.")
+    if target.role != "admin":
+        raise ValueError("Break-glass recovery is limited to existing administrator accounts.")
+    was_active = target.active
+    target.password_hash = hash_password(new_password)
+    target.active = True
+    revoke_user_sessions(db, target.id)
+    audit(
+        db,
+        "break_glass_password_reset",
+        "user",
+        target.id,
+        reason="Local break-glass administrator recovery",
+        before={"active": was_active},
+        after={"active": True, "sessions_revoked": True},
+    )
+    return target
 
 
 def get_setting(db: Session, key: str, default: str | None = None) -> str | None:

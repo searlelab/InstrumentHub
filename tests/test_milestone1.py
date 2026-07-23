@@ -15,11 +15,11 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import OperationalError
 
 from instrumenthub.db import Database, _apply_migration, run_migrations
-from instrumenthub.__main__ import bootstrap_admin
+from instrumenthub.__main__ import bootstrap_admin, reset_admin_password
 from instrumenthub.web import create_app
 from instrumenthub.models import AuditEvent, Instrument, SessionRecord, User
 from instrumenthub.scheduling import slots_for_date
-from instrumenthub.security import utc_text
+from instrumenthub.security import parse_utc, utc_text, verify_password
 from instrumenthub.services import audit, complete_setup, create_user
 from tests.conftest import login
 
@@ -206,6 +206,116 @@ def test_password_change_revokes_all_sessions(client, app):
         assert second.get("/profile", follow_redirects=False).status_code == 303
     finally:
         second.__exit__(None, None, None)
+
+
+def test_admin_password_reset_revokes_target_sessions_and_accepts_only_admin(client, app):
+    member_client = client.__class__(app)
+    member_client.__enter__()
+    try:
+        member_csrf = login(member_client, "member", "correct-horse-member!")
+        forbidden = member_client.post(
+            "/admin/users/2/password",
+            data={"csrf_token": member_csrf, "new_password": "replacement-password", "new_password_confirmation": "replacement-password", "reason": "Unauthorized"},
+        )
+        assert forbidden.status_code == 403
+
+        admin_csrf = login(client)
+        response = client.post(
+            "/admin/users/2/password",
+            data={"csrf_token": admin_csrf, "new_password": "replacement-password", "new_password_confirmation": "replacement-password", "reason": "Member forgot password"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        assert member_client.get("/profile", follow_redirects=False).status_code == 303
+        assert member_client.post("/login", data={"username": "member", "password": "replacement-password"}, follow_redirects=False).status_code == 303
+        with app.state.database.session() as db:
+            event = db.scalar(select(AuditEvent).where(AuditEvent.action == "password_reset"))
+            assert event.actor_user_id == 1 and event.reason == "Member forgot password"
+            assert "password" not in event.after_json
+    finally:
+        member_client.__exit__(None, None, None)
+
+
+def test_admin_self_reset_logs_out_current_session(client):
+    csrf = login(client)
+    response = client.post(
+        "/admin/users/1/password",
+        data={"csrf_token": csrf, "new_password": "new-admin-password", "new_password_confirmation": "new-admin-password", "reason": "Routine rotation"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303 and response.headers["location"] == "/login"
+    assert client.get("/admin", follow_redirects=False).status_code == 303
+    assert client.post("/login", data={"username": "admin", "password": "new-admin-password"}, follow_redirects=False).status_code == 303
+
+
+def test_break_glass_cli_is_guarded_and_recovers_deactivated_admin(app, settings, monkeypatch, capsys):
+    with app.state.database.session() as db:
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        admin.active = False
+    assert reset_admin_password(settings, "admin", confirmed=False) == 2
+    answers = iter(["break-glass-password", "break-glass-password"])
+    monkeypatch.setattr("instrumenthub.__main__.getpass.getpass", lambda _prompt: next(answers))
+    assert reset_admin_password(settings, "admin", confirmed=True) == 0
+    output = capsys.readouterr()
+    assert str(settings.database_path) in output.out
+    with app.state.database.session() as db:
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        assert admin.active and verify_password(admin.password_hash, "break-glass-password")
+        event = db.scalar(select(AuditEvent).where(AuditEvent.action == "break_glass_password_reset"))
+        assert event.actor_user_id is None
+
+
+def test_break_glass_cli_refuses_non_administrator(app, settings, monkeypatch):
+    answers = iter(["break-glass-password", "break-glass-password"])
+    monkeypatch.setattr("instrumenthub.__main__.getpass.getpass", lambda _prompt: next(answers))
+    with pytest.raises(ValueError, match="limited to existing administrator"):
+        reset_admin_password(settings, "member", confirmed=True)
+
+
+def test_calendar_poll_does_not_refresh_idle_activity_but_navigation_does(client, configured, app):
+    with app.state.database.session() as db:
+        session = db.scalar(select(SessionRecord).where(SessionRecord.user_id == 1, SessionRecord.revoked_at.is_(None)))
+        original = utc_text(datetime.now(UTC) - timedelta(minutes=10))
+        session.last_seen_at = original
+    response = client.get("/api/calendar?instrument_id=1&month=2026-08")
+    assert response.status_code == 200
+    with app.state.database.session() as db:
+        session = db.scalar(select(SessionRecord).where(SessionRecord.user_id == 1, SessionRecord.revoked_at.is_(None)))
+        assert session.last_seen_at == original
+    assert client.get("/calendar").status_code == 200
+    with app.state.database.session() as db:
+        session = db.scalar(select(SessionRecord).where(SessionRecord.user_id == 1, SessionRecord.revoked_at.is_(None)))
+        assert parse_utc(session.last_seen_at) > parse_utc(original)
+
+
+def test_calendar_poll_allows_idle_session_to_expire(client, configured, app):
+    with app.state.database.session() as db:
+        session = db.scalar(select(SessionRecord).where(SessionRecord.user_id == 1, SessionRecord.revoked_at.is_(None)))
+        session.last_seen_at = utc_text(datetime.now(UTC) - timedelta(minutes=481))
+    response = client.get("/api/calendar?instrument_id=1&month=2026-08", follow_redirects=False)
+    assert response.status_code == 303 and response.headers["location"].startswith("/login")
+    with app.state.database.session() as db:
+        session = db.scalar(select(SessionRecord).where(SessionRecord.user_id == 1))
+        assert session.revoked_at is not None
+
+
+def test_unhandled_error_response_keeps_security_headers_and_request_log(client, app, settings):
+    def explode():
+        raise RuntimeError("probe failure")
+
+    app.add_api_route("/test-unhandled-error", explode)
+    response = client.get("/test-unhandled-error")
+    assert response.status_code == 500
+    assert response.headers["content-security-policy"].startswith("default-src 'self'")
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["referrer-policy"] == "same-origin"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-request-id"]
+    for handler in __import__("logging").getLogger("instrumenthub").handlers:
+        handler.flush()
+    log_text = (settings.log_dir / "instrumenthub.jsonl").read_text(encoding="utf-8")
+    assert '"path":"/test-unhandled-error"' in log_text
+    assert '"status":500' in log_text
 
 
 def test_login_throttling(client):

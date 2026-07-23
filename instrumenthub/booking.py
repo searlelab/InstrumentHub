@@ -11,7 +11,7 @@ from .models import Booking, CalendarEntry, Grant, Hold, Instrument, PI, Project
 from .rules import RuleResult, estimate_duration_minutes, evaluate_booking, overall_result
 from .scheduling import Slot, prune_expired_holds, prune_expired_tentatives, reservation_overlap, reserve_slots, slots_for_range
 from .security import hash_token, parse_utc, utc_text, utcnow
-from .services import audit, get_setting
+from .services import audit, get_setting, require_active_admin
 
 
 def configured_slots(db: Session, instrument_id: int, start_text: str, count: int) -> list[Slot]:
@@ -32,9 +32,16 @@ def configured_slots(db: Session, instrument_id: int, start_text: str, count: in
     return selected
 
 
-def acquire_hold(db: Session, *, user: User, instrument_id: int, start_text: str, count: int, request_id: str = "") -> tuple[Hold, str, list[Slot]]:
+def _serialize_hold_write(db: Session) -> None:
+    db.flush()
     if not db.in_transaction():
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+    else:
+        db.execute(text("UPDATE app_settings SET value=value WHERE 0"))
+
+
+def acquire_hold(db: Session, *, user: User, instrument_id: int, start_text: str, count: int, request_id: str = "") -> tuple[Hold, str, list[Slot]]:
+    _serialize_hold_write(db)
     prune_expired_holds(db)
     prune_expired_tentatives(db)
     instrument = db.get(Instrument, instrument_id)
@@ -44,6 +51,30 @@ def acquire_hold(db: Session, *, user: User, instrument_id: int, start_text: str
     now = utcnow(); token = secrets.token_urlsafe(32)
     if any(slot.start.astimezone(UTC) <= now for slot in slots):
         raise ValueError("All selected booking blocks must be in the future.")
+    existing_holds = db.execute(
+        select(Hold, CalendarEntry)
+        .join(CalendarEntry, CalendarEntry.id == Hold.calendar_entry_id)
+        .where(Hold.user_id == user.id, CalendarEntry.instrument_id == instrument_id)
+        .order_by(Hold.id)
+    ).all()
+    for existing_hold, existing_entry in existing_holds:
+        audit(
+            db,
+            "superseded",
+            "hold",
+            existing_hold.id,
+            actor_user_id=user.id,
+            after={"replacement_instrument_id": instrument_id},
+            request_id=request_id,
+        )
+        db.delete(existing_entry)
+    if existing_holds:
+        db.flush()
+        for existing_hold, existing_entry in existing_holds:
+            if existing_hold in db:
+                db.expunge(existing_hold)
+            if existing_entry in db:
+                db.expunge(existing_entry)
     if reservation_overlap(db, instrument_id=instrument_id, slots=slots):
         raise ValueError("One or more selected instrument blocks are no longer available.")
     entry = CalendarEntry(instrument_id=instrument_id, entry_type="hold", state="held", title="Temporarily held", created_by=user.id, created_at=utc_text(now), updated_at=utc_text(now))
@@ -81,8 +112,7 @@ def submit_booking(
     description: str = "", admin_notes: str = "", override_required: bool = False,
     request_id: str = "", expected_instrument_id: int | None = None,
 ) -> tuple[Booking, list[RuleResult]]:
-    if not db.in_transaction():
-        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+    _serialize_hold_write(db)
     user = db.get(User, user.id)
     if not user or not user.active:
         raise ValueError("Your account is inactive or no longer available.")
@@ -128,3 +158,66 @@ def save_wizard_state(db: Session, session_token: str | None, values: dict[str, 
     record = db.scalar(select(SessionRecord).where(SessionRecord.token_hash == hash_token(session_token)))
     if record:
         record.wizard_json = json.dumps(values, sort_keys=True)
+
+
+def clear_wizard_state(db: Session, session_token: str | None) -> None:
+    if not session_token:
+        return
+    record = db.scalar(select(SessionRecord).where(SessionRecord.token_hash == hash_token(session_token)))
+    if record:
+        record.wizard_json = "{}"
+
+
+def release_hold_as_admin(
+    db: Session,
+    *,
+    hold_id: int,
+    admin_id: int,
+    reason: str,
+    request_id: str = "",
+) -> None:
+    _serialize_hold_write(db)
+    require_active_admin(db, admin_id)
+    if not reason.strip():
+        raise ValueError("A hold-release reason is required.")
+    prune_expired_holds(db)
+    hold = db.get(Hold, hold_id)
+    if not hold:
+        raise ValueError("Hold not found or already expired.")
+    entry = db.get(CalendarEntry, hold.calendar_entry_id)
+    if not entry:
+        raise ValueError("Hold not found or already expired.")
+    audit(
+        db,
+        "released",
+        "hold",
+        hold.id,
+        actor_user_id=admin_id,
+        reason=reason,
+        after={"owner_user_id": hold.user_id, "instrument_id": entry.instrument_id},
+        request_id=request_id,
+    )
+    db.delete(entry)
+
+
+def release_hold(
+    db: Session,
+    *,
+    hold_id: int,
+    tokens: list[str],
+    user_id: int,
+    request_id: str = "",
+) -> int:
+    _serialize_hold_write(db)
+    prune_expired_holds(db)
+    hold = db.get(Hold, hold_id)
+    if not hold or hold.user_id != user_id:
+        raise ValueError("The hold is missing, expired, or belongs to another user.")
+    token = next((value for value in tokens if secrets.compare_digest(hold.token_hash, hash_token(value))), None)
+    if not token:
+        raise ValueError("The hold is missing, expired, or belongs to another user.")
+    hold, entry, _slots = resolve_hold(db, hold_id=hold_id, token=token, user_id=user_id)
+    instrument_id = entry.instrument_id
+    audit(db, "released", "hold", hold.id, actor_user_id=user_id, request_id=request_id)
+    db.delete(entry)
+    return instrument_id

@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from .config import Settings
 from .db import Database
 from .models import User
-from .services import create_user
+from .services import break_glass_reset_admin_password, create_user
 from .ops import create_backup, restore_backup, verify_database
 
 
@@ -55,10 +55,39 @@ def status(settings: Settings) -> int:
     return 0
 
 
+def reset_admin_password(settings: Settings, username: str, *, confirmed: bool) -> int:
+    if not confirmed:
+        print(
+            "Administrator password reset refused. Pass --confirm-reset after verifying the configured instance.",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"Database: {settings.database_path}")
+    while True:
+        password = getpass.getpass("New password (minimum 12 characters): ")
+        confirmation = getpass.getpass("Confirm new password: ")
+        if password != confirmation:
+            print("Passwords do not match; please try again.", file=sys.stderr)
+            continue
+        if len(password) < 12:
+            print("Password must contain at least 12 characters; please try again.", file=sys.stderr)
+            continue
+        break
+    database = Database(settings)
+    with database.session() as db:
+        administrator = break_glass_reset_admin_password(db, username=username, new_password=password)
+        display_name = administrator.display_name
+    print(f"Administrator password reset for {display_name}; the account is active and all prior sessions are revoked.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="python -m instrumenthub")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("bootstrap-admin", help="Create the first administrator interactively")
+    reset_admin = subparsers.add_parser("reset-admin-password", help="Recover an existing administrator account interactively")
+    reset_admin.add_argument("username")
+    reset_admin.add_argument("--confirm-reset", action="store_true")
     subparsers.add_parser("status", help="Show the local instance path and account count")
     serve = subparsers.add_parser("serve", help="Run the application with one Uvicorn worker")
     serve.add_argument("--host", default="127.0.0.1")
@@ -71,10 +100,12 @@ def main() -> int:
     restore.add_argument("path", type=Path)
     restore.add_argument("--confirm-restore", action="store_true")
     args = parser.parse_args()
-    settings = Settings.from_env()
     try:
+        settings = Settings.from_env()
         if args.command == "bootstrap-admin":
             return bootstrap_admin(settings)
+        if args.command == "reset-admin-password":
+            return reset_admin_password(settings, args.username, confirmed=args.confirm_reset)
         if args.command == "status":
             return status(settings)
         if args.command == "serve":

@@ -8,12 +8,14 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
 from packaging.markers import default_environment
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 from sqlalchemy import select
 
+from instrumenthub.config import Settings
 from instrumenthub.models import User
 from instrumenthub.ops import _quarantine_corrupt_database, create_backup, restore_backup, verify_database
 
@@ -87,6 +89,30 @@ def test_verify_backup_cli_reports_an_expected_error_without_traceback(tmp_path)
     assert "Traceback" not in result.stderr
 
 
+@pytest.mark.parametrize("value", ["0", "-1", "3651", "not-an-integer"])
+def test_settings_reject_destructive_or_invalid_backup_retention(monkeypatch, value):
+    monkeypatch.setenv("INSTRUMENTHUB_BACKUP_RETENTION_DAYS", value)
+    with pytest.raises(ValueError, match="INSTRUMENTHUB_BACKUP_RETENTION_DAYS.*1 through 3650"):
+        Settings.from_env()
+
+
+@pytest.mark.parametrize("value", ["1", "3650"])
+def test_settings_accept_backup_retention_boundaries(monkeypatch, value):
+    monkeypatch.setenv("INSTRUMENTHUB_BACKUP_RETENTION_DAYS", value)
+    assert Settings.from_env().backup_retention_days == int(value)
+
+
+def test_invalid_backup_retention_cli_fails_cleanly_before_database_work(tmp_path):
+    environment = os.environ.copy()
+    environment["INSTRUMENTHUB_INSTANCE"] = str(tmp_path / "must-not-be-created")
+    environment["INSTRUMENTHUB_BACKUP_RETENTION_DAYS"] = "0"
+    result = subprocess.run([sys.executable, "-m", "instrumenthub", "backup"], capture_output=True, text=True, env=environment)
+    assert result.returncode == 1
+    assert "INSTRUMENTHUB_BACKUP_RETENTION_DAYS must be from 1 through 3650" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not (tmp_path / "must-not-be-created").exists()
+
+
 def test_request_log_is_structured_and_omits_query_secrets(client, app, settings):
     client.get("/login?token=do-not-log")
     for handler in __import__("logging").getLogger("instrumenthub").handlers:
@@ -101,6 +127,8 @@ def test_admin_operational_status_hides_paths(client, configured, settings):
     response = client.get("/admin/operations")
     assert response.status_code == 200
     assert "Database integrity" in response.text
+    assert "Recent backup files (not verified here)" in response.text
+    assert "Recent verified backup files" not in response.text
     assert str(settings.database_path) not in response.text
 
 
@@ -138,6 +166,11 @@ def test_windows_offline_deployment_assets_exist():
         assert "INSTRUMENTHUB_INSTANCE" in (root / "deploy/windows" / script).read_text()
     install = (root / "deploy/windows/install.ps1").read_text()
     assert "backup.ps1" in install and "-m instrumenthub backup" not in install
+    assert "BackupRetentionDays" in install and "-RetentionDays $BackupRetentionDays" in install
+    backup_script = (root / "deploy/windows/backup.ps1").read_text()
+    assert "INSTRUMENTHUB_BACKUP_RETENTION_DAYS" in backup_script and "RetentionDays" in backup_script
+    recovery_guide = (root / "docs/backup-recovery.md").read_text()
+    assert "-BackupRetentionDays" in recovery_guide and "scheduled backup task" in recovery_guide
     assert '"NT AUTHORITY\\LocalService"' in install
     assert "NT AUTHORITY\\NetworkService" in install and "DOMAIN\\gMSA$" in install
     assert '$AclServiceAccount = if ($ServiceAccount -eq "LocalSystem") { "NT AUTHORITY\\SYSTEM" } else { $ServiceAccount }' in install

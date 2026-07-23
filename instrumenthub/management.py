@@ -53,7 +53,7 @@ def owner_can_manage_booking(booking: Booking, entry: CalendarEntry, rows: list[
     )
 
 
-def transition_booking(db: Session, *, booking_id: int, new_state: str, admin_id: int, reason: str, request_id: str = "") -> None:
+def transition_booking(db: Session, *, booking_id: int, new_state: str, admin_id: int, reason: str, request_id: str = "") -> int:
     _serialize_booking_write(db)
     admin = require_active_admin(db, admin_id)
     if not reason.strip():
@@ -61,14 +61,21 @@ def transition_booking(db: Session, *, booking_id: int, new_state: str, admin_id
     booking, entry, _rows = _booking_parts(db, booking_id)
     if new_state not in TRANSITIONS.get(entry.state, set()):
         raise ValueError(f"Cannot transition a {entry.state} booking to {new_state}.")
+    instrument = db.get(Instrument, entry.instrument_id)
+    if booking.queue_order is not None and instrument and instrument.unavailable and new_state in {"active", "confirmed"}:
+        raise ValueError(
+            f"Booking {booking.id} ({entry.title}) is paused by an unresolved outage. "
+            "Resume or recover the instrument outage before changing this booking's lifecycle state."
+        )
     if new_state == "canceled":
         cancel_booking(db, booking_id=booking_id, actor=admin, reason=reason, request_id=request_id)
-        return
+        return entry.id
     if new_state == "rejected":
         decide_booking(db, booking_id=booking_id, decision="rejected", admin_id=admin_id, reason=reason, request_id=request_id)
-        return
+        return entry.id
     old = entry.state; entry.state = new_state; entry.updated_at = utc_text()
     audit(db, "state_changed", "booking", booking.id, actor_user_id=admin_id, reason=reason, before={"state": old}, after={"state": new_state}, request_id=request_id)
+    return entry.id
 
 
 def decide_booking(db: Session, *, booking_id: int, decision: str, admin_id: int, reason: str, request_id: str = "") -> None:
@@ -138,8 +145,11 @@ def edit_booking(
         raise ValueError("An administrator reason is required.")
     if not experiment_code.strip() or expected_minutes <= 0 or not sample_category.strip():
         raise ValueError("Experiment code, expected duration, and sample category are required.")
-    if new_start and entry.state in TERMINAL_STATES:
-        raise ValueError(f"A {entry.state} booking cannot be rescheduled.")
+    if new_start and entry.state not in {"tentative", "confirmed"}:
+        article = "An" if entry.state == "active" else "A"
+        raise ValueError(
+            f"{article} {entry.state} booking cannot be rescheduled. Use explicit lifecycle transitions before changing its reserved time."
+        )
     old_state = entry.state
     current_count = len(rows)
     target_count = current_count if block_count is None else block_count
@@ -206,9 +216,14 @@ def _shift_by_block_span(db: Session, *, instrument_id: int, outage_slots: list[
     first_date = outage_slots[0].start.astimezone(zone).date()
     last_date = max(parse_utc(row.slot_start).astimezone(zone).date() for row in affected)
     existing = slots_for_range(db, instrument_id, first_date, min(last_date, first_date + timedelta(days=400)), timezone)
+    if not existing:
+        raise ValueError("The outage start date has no configured instrument blocks to shift.")
     while existing[-1].start.astimezone(zone).date() < last_date:
         page_start = existing[-1].start.astimezone(zone).date() + timedelta(days=1)
-        existing.extend(slots_for_range(db, instrument_id, page_start, min(last_date, page_start + timedelta(days=400)), timezone))
+        page = slots_for_range(db, instrument_id, page_start, min(last_date, page_start + timedelta(days=400)), timezone)
+        if not page:
+            raise ValueError("The affected schedule crosses a period with no configured instrument blocks to shift.")
+        existing.extend(page)
     existing_indexes = {slot.start_text: index for index, slot in enumerate(existing)}
     required_count = max(existing_indexes.get(row.slot_start, -1) for row in affected) + len(outage_slots) + 1
     candidates = _configured_slots_from(db, instrument_id=instrument_id, start_date=first_date, required_count=required_count, timezone=timezone)
@@ -303,7 +318,10 @@ def _reconcile_resume_items(db: Session, *, instrument_id: int, items: list[dict
         expected_state = "paused" if entry.entry_type == "booking" else "maintenance"
         has_slots = db.scalar(select(ReservedSlot.id).where(ReservedSlot.calendar_entry_id == entry.id, ReservedSlot.slot_start >= item["old_start"]).limit(1))
         if entry.instrument_id != instrument_id or entry.state != expected_state or has_slots:
-            raise ValueError("The schedule preview is stale because an affected entry changed. Regenerate the preview.")
+            raise ValueError(
+                f"Schedule entry {entry.id} ({entry.title}) is in state '{entry.state}' or has regained reserved slots; "
+                f"the unresolved outage requires state '{expected_state}' with no slots. Correct that entry before regenerating the resume preview."
+            )
         reconciled.append(item)
     return reconciled
 
@@ -368,6 +386,7 @@ def preview_resume(db: Session, *, instrument_id: int, restart_date: date, admin
 
 def recover_unknown_outage(db: Session, *, instrument_id: int, admin_id: int, reason: str, request_id: str = "") -> int:
     """Last-resort recovery for an unreconstructable outage; affected bookings are canceled."""
+    _serialize_booking_write(db)
     require_active_admin(db, admin_id)
     if not reason.strip():
         raise ValueError("A recovery reason is required.")
@@ -391,6 +410,35 @@ def recover_unknown_outage(db: Session, *, instrument_id: int, admin_id: int, re
     for source in sources:
         source.status = "discarded"
         audit(db, "recovered", "schedule_change", source.id, actor_user_id=admin_id, reason=reason, after={"canceled_bookings": canceled}, request_id=request_id)
+    outage_entries = db.scalars(
+        select(CalendarEntry)
+        .join(Maintenance, Maintenance.calendar_entry_id == CalendarEntry.id)
+        .where(
+            CalendarEntry.instrument_id == instrument_id,
+            CalendarEntry.entry_type == "outage",
+            CalendarEntry.state == "outage",
+            Maintenance.kind == "outage",
+            Maintenance.known_duration.is_(False),
+            Maintenance.restart_at.is_(None),
+        )
+        .order_by(CalendarEntry.id)
+    ).all()
+    for outage_entry in outage_entries:
+        slot_count = len(db.scalars(select(ReservedSlot).where(ReservedSlot.calendar_entry_id == outage_entry.id)).all())
+        outage_entry.state = "canceled"
+        outage_entry.updated_at = utc_text()
+        db.execute(delete(ReservedSlot).where(ReservedSlot.calendar_entry_id == outage_entry.id))
+        audit(
+            db,
+            "canceled",
+            "outage",
+            outage_entry.id,
+            actor_user_id=admin_id,
+            reason=reason,
+            before={"state": "outage", "reserved_slots": slot_count},
+            after={"state": "canceled", "reserved_slots": 0},
+            request_id=request_id,
+        )
     instrument.unavailable = False
     return canceled
 
