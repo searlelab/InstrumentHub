@@ -1,0 +1,2 @@
+{% extends "base.html" %}{% block content %}<section class="card narrow"><h1>{{ status }}</h1><p>{{ message }}</p>{% if request.state.request_id %}<small>Request {{ request.state.request_id }}</small>{% endif %}</section>{% endblock %}
+

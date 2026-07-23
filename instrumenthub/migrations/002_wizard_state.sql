@@ -1,0 +1,2 @@
+ALTER TABLE sessions ADD COLUMN wizard_json TEXT NOT NULL DEFAULT '{}';
+

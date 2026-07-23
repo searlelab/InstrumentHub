@@ -1,0 +1,11 @@
+<service>
+  <id>InstrumentHubCaddy</id>
+  <name>InstrumentHub HTTPS Proxy</name>
+  <description>Caddy TLS reverse proxy for InstrumentHub</description>
+  <executable>%BASE%\caddy.exe</executable>
+  <arguments>run --config &quot;__DATA_DIRECTORY__\Caddyfile&quot; --adapter caddyfile</arguments>
+  <serviceaccount><username>__SERVICE_ACCOUNT__</username><allowservicelogon>true</allowservicelogon></serviceaccount>
+  <logpath>__DATA_DIRECTORY__\logs</logpath>
+  <log mode="roll-by-size"><sizeThreshold>10240</sizeThreshold><keepFiles>8</keepFiles></log>
+  <onfailure action="restart" delay="10 sec" />
+</service>

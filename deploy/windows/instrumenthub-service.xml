@@ -1,0 +1,14 @@
+<service>
+  <id>InstrumentHub</id>
+  <name>InstrumentHub Scheduler</name>
+  <description>InstrumentHub FastAPI application (single worker)</description>
+  <executable>%BASE%\venv\Scripts\python.exe</executable>
+  <arguments>-m instrumenthub serve --host 127.0.0.1 --port 8000</arguments>
+  <env name="INSTRUMENTHUB_INSTANCE" value="__DATA_DIRECTORY__" />
+  <env name="INSTRUMENTHUB_SECURE_COOKIES" value="true" />
+  <serviceaccount><username>__SERVICE_ACCOUNT__</username><allowservicelogon>true</allowservicelogon></serviceaccount>
+  <logpath>__DATA_DIRECTORY__\logs</logpath>
+  <log mode="roll-by-size"><sizeThreshold>10240</sizeThreshold><keepFiles>8</keepFiles></log>
+  <onfailure action="restart" delay="10 sec" />
+  <stoptimeout>30 sec</stoptimeout>
+</service>

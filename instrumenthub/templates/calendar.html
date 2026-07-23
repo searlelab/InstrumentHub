@@ -1,0 +1,25 @@
+{% extends "base.html" %}{% block content %}
+<div class="calendar-head" data-accent="{{ accent_index }}">
+  {% if message %}<p class="warning">{{ message }}</p>{% endif %}
+  <div>
+    <h1>{{ month_label }}</h1>
+    <p>Times shown in {{ timezone }}. Click and drag across open blocks to hold consecutive time.</p>
+  </div>
+  <nav class="instrument-switch">
+    {% for item in instruments %}<a data-accent="{{ loop.index0 }}" class="{% if item.id == instrument.id %}active{% endif %}" href="/calendar?instrument_id={{ item.id }}&month={{ month }}">{{ item.name }}</a>{% endfor %}
+  </nav>
+  <nav class="month-nav">
+    <a href="?instrument_id={{ instrument.id }}&month={{ previous_month }}">‹ Prev</a>
+    <a href="?instrument_id={{ instrument.id }}&month={{ next_month }}">Next ›</a>
+  </nav>
+</div>
+<div class="legend" data-accent="{{ accent_index }}"><span class="state available">Open</span><span class="state confirmed">Confirmed</span><span class="state tentative">Tentative</span><span class="state held">Held</span><span class="state maintenance">Maintenance</span><span class="state outage">Outage</span></div>
+<div class="calendar-dow"><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span></div>
+<div class="calendar" data-accent="{{ accent_index }}" data-instrument="{{ instrument.id }}" data-month="{{ month }}">{% for day in days %}<section class="calendar-day {% if day.month != selected_month %}outside{% endif %}"><h2>{{ day.strftime('%a %b %d') }}</h2>{% for slot in slots_by_day.get(day.isoformat(), []) %}<div class="slot {{ slot.status }}" data-start="{{ slot.start }}" data-end="{{ slot.end }}" data-status="{{ slot.status }}"><strong>{{ slot.name }}</strong><span>{{ slot.title }}{% if slot.handler_initials %} · {{ slot.handler_initials }}{% endif %}</span>{% if slot.entry_id and slot.status != 'held' %}<a href="/entries/{{ slot.entry_id }}">Details</a>{% elif slot.status == 'available' %}<a class="drag-hint" href="/book/new?instrument_id={{ instrument.id }}&slot_start={{ slot.start|urlencode }}">Select →</a>{% endif %}</div>{% endfor %}</section>{% endfor %}</div>
+<div class="select-bar" data-accent="{{ accent_index }}" id="select-bar">
+  <strong data-select-summary>No blocks selected</strong>
+  <span class="spacer"></span>
+  <button type="button" class="clear" data-select-clear>Clear</button>
+  <form method="post" action="/book/hold"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="instrument_id" value="{{ instrument.id }}"><input type="hidden" name="slot_start" data-select-start><input type="hidden" name="count" data-select-count value="0"><button type="submit">Hold selected blocks</button></form>
+</div>
+{% if user.role == 'admin' %}<section><h2>Block maintenance or outage</h2><form method="post" action="/admin/maintenance" class="grid-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="instrument_id" value="{{ instrument.id }}"><label>From<input type="date" name="start_date" required></label><label>Through<input type="date" name="end_date" required></label><label>Type<select name="kind"><option value="routine">Routine maintenance</option><option value="emergency">Emergency maintenance</option><option value="outage">Unavailable/outage</option></select></label><label>Reason<input name="reason" required></label><button>Block schedule</button></form></section>{% endif %}{% endblock %}

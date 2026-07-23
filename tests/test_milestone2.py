@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+from datetime import date, timedelta
+
+from sqlalchemy import select
+
+from instrumenthub.booking import acquire_hold
+from instrumenthub.models import Instrument, User
+from instrumenthub.security import utc_text, utcnow
+from tests.test_milestone4 import make_booking
+from instrumenthub.services import replace_block_definitions
+from instrumenthub.scheduling import create_maintenance, month_days, slots_for_date
+from tests.conftest import login
+
+
+def test_month_grid_includes_complete_weeks():
+    days = month_days(2026, 8)
+    assert len(days) in {35, 42}
+    assert days[0].weekday() == 0
+    assert days[-1].weekday() == 6
+
+
+def test_overnight_slots_preserve_nominal_duration_across_dst(app, configured):
+    with app.state.database.session() as db:
+        instrument = db.scalar(select(Instrument).order_by(Instrument.id))
+        slots = slots_for_date(db, instrument.id, date(2026, 11, 1), "America/Chicago")
+        night = next(slot for slot in slots if slot.name == "Night")
+        assert night.nominal_minutes == 16 * 60
+        assert night.end.date() == night.start.date() + timedelta(days=1)
+
+
+def test_calendar_requires_authentication(client, configured):
+    client.post("/logout", data={"csrf_token": configured})
+    response = client.get("/api/calendar?instrument_id=1&month=2026-08", follow_redirects=False)
+    assert response.status_code == 303
+
+
+def test_calendar_renders_both_instruments_and_local_blocks(client, configured):
+    response = client.get("/calendar?month=2026-08")
+    assert response.status_code == 200
+    assert "Orbitrap A" in response.text
+    assert "Orbitrap B" in response.text
+    assert "Morning" in response.text
+    assert "America/Chicago" in response.text
+
+
+def test_maintenance_occupies_slots_and_conflicts(client, configured, app):
+    target = date.today() + timedelta(days=2)
+    data = {"csrf_token": configured, "instrument_id": "1", "start_date": target.isoformat(), "end_date": target.isoformat(), "kind": "routine", "reason": "Calibration"}
+    first = client.post("/admin/maintenance", data=data, follow_redirects=False)
+    assert first.status_code == 303
+    second = client.post("/admin/maintenance", data=data, follow_redirects=False)
+    assert second.status_code == 409
+    api = client.get(f"/api/calendar?instrument_id=1&month={target.strftime('%Y-%m')}").json()
+    occupied = [slot for slot in api["slots"] if slot["date"] == target.isoformat()]
+    assert occupied and all(slot["status"] == "maintenance" for slot in occupied)
+
+
+def test_maintenance_prunes_expired_holds_before_reserving(app, configured):
+    target = date.today() + timedelta(days=3)
+    with app.state.database.session() as db:
+        member = db.scalar(select(User).where(User.username == "member"))
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        slot = slots_for_date(db, 1, target, "America/Chicago")[0]
+        hold, _token, _slots = acquire_hold(db, user=member, instrument_id=1, start_text=slot.start_text, count=1)
+        hold.expires_at = utc_text(utcnow() - timedelta(minutes=1))
+        entry = create_maintenance(db, instrument_id=1, start_date=target, end_date=target, kind="routine", reason="Calibration", actor_user_id=admin.id)
+        assert entry.id
+
+
+def test_authenticated_member_can_view_booking_contact_later(client, configured):
+    # The detail route itself is protected; Milestone 3 supplies booking rows.
+    assert client.get("/entries/9999").status_code == 404
+    client.post("/logout", data={"csrf_token": configured})
+    login(client, "member", "correct-horse-member!")
+    assert client.get("/entries/9999").status_code == 404
+
+
+def test_calendar_includes_booking_handler_initials(client, app, configured):
+    _booking_id, _entry_id, start = make_booking(app, days=28)
+    month = start[:7]
+    page = client.get(f"/calendar?instrument_id=2&month={month}")
+    assert "OPS-28 · LM" in page.text
+    slots = client.get(f"/api/calendar?instrument_id=2&month={month}").json()["slots"]
+    assert next(slot for slot in slots if slot["title"] == "OPS-28")["handler_initials"] == "LM"
+
+
+def test_block_and_maintenance_services_require_an_active_administrator(app, configured):
+    with app.state.database.session() as db:
+        member = db.scalar(select(User).where(User.username == "member"))
+        with __import__("pytest").raises(ValueError, match="active administrator"):
+            replace_block_definitions(db, instrument_id=1, effective_from=date.today() + timedelta(days=30), blocks_text="Day,09:00,17:00", actor_user_id=member.id)
+        with __import__("pytest").raises(ValueError, match="active administrator"):
+            create_maintenance(db, instrument_id=1, start_date=date.today() + timedelta(days=2), end_date=date.today() + timedelta(days=2), kind="routine", reason="Unauthorized", actor_user_id=member.id)
+
+
+def test_future_block_version_does_not_reinterpret_current_schedule(app, configured):
+    future = date.today() + timedelta(days=30)
+    with app.state.database.session() as db:
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        replace_block_definitions(db, instrument_id=1, effective_from=future, blocks_text="Day,09:00,17:00", actor_user_id=admin.id)
+    with app.state.database.session() as db:
+        current = slots_for_date(db, 1, date.today() + timedelta(days=1), "America/Chicago")
+        revised = slots_for_date(db, 1, future, "America/Chicago")
+        assert current[0].name == "Morning"
+        assert [slot.name for slot in revised] == ["Day"]
+
+
+def test_block_version_rejects_overlap_across_an_overnight_cutover(app, configured):
+    future = date.today() + timedelta(days=30)
+    with app.state.database.session() as db:
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        with __import__("pytest").raises(ValueError, match="effective-date boundary"):
+            replace_block_definitions(db, instrument_id=1, effective_from=future, blocks_text="Early,00:00,12:00", actor_user_id=admin.id)
+
+
+def test_calendar_api_rejects_inactive_instruments_like_the_html_page(app, client, configured):
+    with app.state.database.session() as db:
+        db.get(Instrument, 1).active = False
+    month = (date.today() + timedelta(days=3)).strftime("%Y-%m")
+    assert client.get(f"/calendar?instrument_id=1&month={month}").status_code == 404
+    assert client.get(f"/api/calendar?instrument_id=1&month={month}").status_code == 404
+
+
+def test_block_version_rejects_a_cutover_that_would_orphan_booking_slots(app, configured):
+    _booking_id, _entry_id, _start = make_booking(app, days=40)
+    with app.state.database.session() as db:
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        with __import__("pytest").raises(ValueError, match="scheduled reservation"):
+            replace_block_definitions(db, instrument_id=2, effective_from=date.today() + timedelta(days=30), blocks_text="Day,09:00,17:00", actor_user_id=admin.id)
