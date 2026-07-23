@@ -68,4 +68,7 @@ Invoke-Native "$InstallDirectory\InstrumentHubCaddy.exe" @("start")
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$InstallDirectory\deploy\windows\backup.ps1`" -InstallDirectory `"$InstallDirectory`" -DataDirectory `"$DataDirectory`" -RetentionDays $BackupRetentionDays"
 $trigger = New-ScheduledTaskTrigger -Daily -At 2am
 Register-ScheduledTask -TaskName "InstrumentHub Daily Backup" -Action $action -Trigger $trigger -User "SYSTEM" -RunLevel Highest -Force | Out-Null
+$notificationAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$InstallDirectory\deploy\windows\deliver-notifications.ps1`" -InstallDirectory `"$InstallDirectory`" -DataDirectory `"$DataDirectory`""
+$notificationTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(5) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 1)
+Register-ScheduledTask -TaskName "InstrumentHub Notification Delivery" -Action $notificationAction -Trigger $notificationTrigger -User "SYSTEM" -RunLevel Highest -Force | Out-Null
 Write-Host "Installed. Run the bootstrap-admin command interactively, then complete setup over HTTPS."

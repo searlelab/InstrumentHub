@@ -6,3 +6,4 @@ To book, select an available fixed block, choose the consecutive block count, an
 
 Open a booking to see its schedule, handler, authenticated-member contact details, and status. Owners may edit or cancel eligible future tentative or confirmed bookings. Contact an administrator for active, paused, completed, rejected, historical, or administratively changed bookings.
 
+Use Inbox to review booking confirmations, approval decisions, cancellations, and applied schedule changes. The calendar identifies the currently scheduled instrument handler and their authenticated-member contact details; it explicitly says when nobody is currently scheduled.

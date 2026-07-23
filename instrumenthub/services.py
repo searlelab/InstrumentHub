@@ -34,9 +34,8 @@ def audit(
     before: Any = None,
     after: Any = None,
     request_id: str = "",
-) -> None:
-    db.add(
-        AuditEvent(
+) -> AuditEvent:
+    event = AuditEvent(
             actor_user_id=actor_user_id,
             action=action,
             entity_type=entity_type,
@@ -46,8 +45,9 @@ def audit(
             after_json=json.dumps(sanitize(after or {}), sort_keys=True, separators=(",", ":")),
             request_id=request_id,
             created_at=utc_text(),
-        )
     )
+    db.add(event)
+    return event
 
 
 def require_active_admin(db: Session, user_id: int) -> User:

@@ -29,7 +29,7 @@ def test_migrations_are_idempotent_and_integrity_is_ok(settings):
     run_migrations(settings.database_path)
     with sqlite3.connect(settings.database_path) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 5
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 7
 
 
 def test_concurrent_first_run_migrations_share_one_fresh_database(tmp_path, monkeypatch):
@@ -51,7 +51,7 @@ def test_concurrent_first_run_migrations_share_one_fresh_database(tmp_path, monk
     assert results == [None, None]
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 5
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 7
 
 
 def test_utc_text_has_fixed_sortable_microsecond_precision():

@@ -16,9 +16,11 @@ from .rules import evaluate_booking, overall_result
 from .scheduling import Slot, prune_expired_holds, reservation_overlap, reserve_slots, slots_for_range
 from .security import parse_utc, utc_text
 from .services import audit, get_setting, require_active_admin
+from .notifications import enqueue_notification
 from .booking import configured_slots
 
 TERMINAL_STATES = {"completed", "canceled", "rejected"}
+_UNSET = object()
 TRANSITIONS = {
     "tentative": {"rejected", "canceled"},
     "confirmed": {"active", "paused", "canceled"},
@@ -94,6 +96,7 @@ def decide_booking(db: Session, *, booking_id: int, decision: str, admin_id: int
         entry.state = "confirmed"
     else:
         entry.state = "rejected"
+        booking.reserved_minutes = sum(row.nominal_minutes for row in rows)
         for row in rows:
             db.delete(row)
     entry.updated_at = utc_text()
@@ -104,6 +107,7 @@ def decide_booking(db: Session, *, booking_id: int, decision: str, admin_id: int
     except IntegrityError as exc:
         db.rollback()
         raise ValueError("This approval round has already received a final decision.") from exc
+    enqueue_notification(db, recipient_user_id=booking.user_id, event_key=f"booking:{booking.id}:decision:{booking.approval_round}", title="Booking approved" if decision == "approved" else "Booking rejected", body=f"{entry.title} was {decision}. {reason}", link=f"/entries/{entry.id}")
 
 
 def cancel_booking(db: Session, *, booking_id: int, actor: User, reason: str = "User cancellation", request_id: str = "") -> None:
@@ -120,15 +124,17 @@ def cancel_booking(db: Session, *, booking_id: int, actor: User, reason: str = "
             raise ValueError("This booking is not eligible for owner cancellation.")
     elif not reason.strip():
         raise ValueError("An administrator reason is required.")
-    old = entry.state; entry.state = "canceled"; entry.updated_at = utc_text()
+    old = entry.state; entry.state = "canceled"; entry.updated_at = utc_text(); booking.reserved_minutes = sum(row.nominal_minutes for row in rows)
     for row in rows:
         db.delete(row)
     audit(db, "canceled", "booking", booking.id, actor_user_id=actor.id, reason=reason, before={"state": old}, after={"state": "canceled"}, request_id=request_id)
+    enqueue_notification(db, recipient_user_id=booking.user_id, event_key=f"booking:{booking.id}:canceled:{entry.updated_at}", title="Booking canceled", body=f"{entry.title} was canceled. {reason}", link=f"/entries/{entry.id}")
 
 
 def edit_booking(
     db: Session, *, booking_id: int, actor: User, experiment_code: str, expected_minutes: int,
-    sample_category: str, description: str, admin_notes: str, new_start: str | None = None,
+    sample_category: str, description: str, admin_notes: str, column_setup: str | object = _UNSET,
+    libraries_present: bool | object = _UNSET, gradient_minutes: int | None | object = _UNSET, new_start: str | None = None,
     block_count: int | None = None, reason: str = "", request_id: str = "",
 ) -> None:
     actor_id = actor.id
@@ -143,7 +149,7 @@ def edit_booking(
         raise ValueError("This booking is not eligible for owner editing.")
     if not owner_edit and not reason.strip():
         raise ValueError("An administrator reason is required.")
-    if not experiment_code.strip() or expected_minutes <= 0 or not sample_category.strip():
+    if not experiment_code.strip() or expected_minutes <= 0 or not sample_category.strip() or (gradient_minutes is not _UNSET and gradient_minutes is not None and gradient_minutes <= 0):
         raise ValueError("Experiment code, expected duration, and sample category are required.")
     if new_start and entry.state not in {"tentative", "confirmed"}:
         article = "An" if entry.state == "active" else "A"
@@ -157,7 +163,7 @@ def edit_booking(
         raise ValueError("A booking may select between 1 and 100 consecutive blocks.")
     if not new_start and target_count != current_count:
         raise ValueError("Choose a new block start when changing the number of reserved blocks.")
-    before = {"experiment_code": booking.experiment_code, "expected_minutes": booking.expected_minutes, "sample_category": booking.sample_category, "state": entry.state, "start": rows[0].slot_start if rows else None, "end": rows[-1].slot_end if rows else None, "block_count": current_count}
+    before = {"experiment_code": booking.experiment_code, "expected_minutes": booking.expected_minutes, "sample_category": booking.sample_category, "column_setup": booking.column_setup, "libraries_present": booking.libraries_present, "gradient_minutes": booking.gradient_minutes, "state": entry.state, "start": rows[0].slot_start if rows else None, "end": rows[-1].slot_end if rows else None, "block_count": current_count}
     updated_rows = rows
     if new_start:
         slots = configured_slots(db, entry.instrument_id, new_start, target_count)
@@ -180,10 +186,16 @@ def edit_booking(
         updated_rows = slots
     booking.experiment_code, booking.expected_minutes = experiment_code.strip(), expected_minutes
     booking.sample_category, booking.description = sample_category.strip(), description.strip()
+    if column_setup is not _UNSET:
+        booking.column_setup = column_setup.strip()
+    if libraries_present is not _UNSET:
+        booking.libraries_present = libraries_present
+    if gradient_minutes is not _UNSET:
+        booking.gradient_minutes = gradient_minutes
     if not owner_edit:
         booking.admin_notes = admin_notes.strip()
     entry.title, entry.updated_at = booking.experiment_code, utc_text()
-    audit(db, "updated", "booking", booking.id, actor_user_id=actor.id, reason=reason or "Owner edit", before=before, after={"experiment_code": booking.experiment_code, "expected_minutes": expected_minutes, "sample_category": booking.sample_category, "state": entry.state, "start": updated_rows[0].start_text if new_start else rows[0].slot_start if rows else None, "end": updated_rows[-1].end_text if new_start else rows[-1].slot_end if rows else None, "block_count": len(updated_rows)}, request_id=request_id)
+    audit(db, "updated", "booking", booking.id, actor_user_id=actor.id, reason=reason or "Owner edit", before=before, after={"experiment_code": booking.experiment_code, "expected_minutes": expected_minutes, "sample_category": booking.sample_category, "column_setup": booking.column_setup, "libraries_present": booking.libraries_present, "gradient_minutes": booking.gradient_minutes, "state": entry.state, "start": updated_rows[0].start_text if new_start else rows[0].slot_start if rows else None, "end": updated_rows[-1].end_text if new_start else rows[-1].slot_end if rows else None, "block_count": len(updated_rows)}, request_id=request_id)
 
 
 def _affected_slots(db: Session, instrument_id: int, start_text: str) -> list[ReservedSlot]:
@@ -463,6 +475,11 @@ def apply_schedule_draft(db: Session, *, draft_id: int, admin_id: int, request_i
             "requested_start": booking.requested_start if booking else None,
             "requested_end": booking.requested_end if booking else None,
         })
+    def notify_affected(kind: str, title: str) -> None:
+        for entry_id in sorted({item["entry_id"] for item in payload["items"]}):
+            booking = db.scalar(select(Booking).where(Booking.calendar_entry_id == entry_id))
+            if booking:
+                enqueue_notification(db, recipient_user_id=booking.user_id, event_key=f"schedule:{draft.id}:{kind}:{booking.id}", title=title, body=f"{db.get(CalendarEntry, entry_id).title}: {draft.reason}", link=f"/entries/{entry_id}")
     if draft.kind == "known_outage":
         moving_ids = {item["slot_id"] for item in payload["items"]}
         moving_rows = _source_rows_for_draft(db, instrument_id=draft.instrument_id, items=payload["items"])
@@ -530,10 +547,11 @@ def apply_schedule_draft(db: Session, *, draft_id: int, admin_id: int, request_i
             source.status = "discarded"
         maintenance = db.scalar(select(Maintenance).join(CalendarEntry, CalendarEntry.id == Maintenance.calendar_entry_id).where(CalendarEntry.instrument_id == draft.instrument_id, Maintenance.kind == "outage", Maintenance.known_duration.is_(False)).order_by(Maintenance.id.desc()))
         if maintenance: maintenance.restart_at = payload["restart_at"]
-        draft.status = "applied"; draft.applied_at = utc_text(); audit(db, "applied", "schedule_change", draft.id, actor_user_id=admin_id, reason=draft.reason, after={"kind": draft.kind, "items": audit_items}, request_id=request_id); return
+        draft.status = "applied"; draft.applied_at = utc_text(); audit(db, "applied", "schedule_change", draft.id, actor_user_id=admin_id, reason=draft.reason, after={"kind": draft.kind, "items": audit_items}, request_id=request_id); notify_affected("resume", "Instrument schedule resumed"); return
     now = utc_text(); entry = CalendarEntry(instrument_id=draft.instrument_id, entry_type="outage", state="outage", title="Instrument outage", created_by=admin_id, created_at=now, updated_at=now)
     db.add(entry); db.flush(); db.add(Maintenance(calendar_entry_id=entry.id, kind="outage", known_duration=draft.kind == "known_outage", reason=draft.reason))
     outage_slots = [Slot(parse_utc(item["start"]), parse_utc(item["end"]), item["nominal_minutes"], "Outage") for item in payload["outage_slots"]]
     reserve_slots(db, entry, outage_slots)
     draft.status = "applied"; draft.applied_at = utc_text()
     audit(db, "applied", "schedule_change", draft.id, actor_user_id=admin_id, reason=draft.reason, after={"kind": draft.kind, "outage_slots": payload["outage_slots"], "items": audit_items}, request_id=request_id)
+    notify_affected(draft.kind, "Instrument schedule changed")

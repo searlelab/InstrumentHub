@@ -167,6 +167,10 @@ class Booking(Base):
     pre_pause_state: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     administratively_altered: Mapped[bool] = mapped_column(Boolean, default=False)
     approval_round: Mapped[int] = mapped_column(Integer, default=1)
+    column_setup: Mapped[str] = mapped_column(Text, default="")
+    libraries_present: Mapped[bool] = mapped_column(Boolean, default=False)
+    gradient_minutes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    reserved_minutes: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Hold(Base):
@@ -223,4 +227,54 @@ class AuditEvent(Base):
     before_json: Mapped[str] = mapped_column(Text, default="{}")
     after_json: Mapped[str] = mapped_column(Text, default="{}")
     request_id: Mapped[str] = mapped_column(String, default="")
+    created_at: Mapped[str] = mapped_column(String)
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    recipient_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    event_key: Mapped[str] = mapped_column(String)
+    title: Mapped[str] = mapped_column(String)
+    body: Mapped[str] = mapped_column(Text)
+    link: Mapped[str] = mapped_column(String, default="")
+    created_at: Mapped[str] = mapped_column(String)
+    read_at: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+
+class NotificationDelivery(Base):
+    __tablename__ = "notification_deliveries"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    notification_id: Mapped[int] = mapped_column(ForeignKey("notifications.id"), unique=True)
+    state: Mapped[str] = mapped_column(String, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[str] = mapped_column(String)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    sent_at: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+
+class MaintenanceTemplate(Base):
+    __tablename__ = "maintenance_templates"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    instrument_id: Mapped[int] = mapped_column(ForeignKey("instruments.id"))
+    title: Mapped[str] = mapped_column(String)
+    interval_days: Mapped[int] = mapped_column(Integer)
+    expected_minutes: Mapped[int] = mapped_column(Integer)
+    assignee_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    next_due_date: Mapped[str] = mapped_column(String)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[str] = mapped_column(String)
+
+
+class MaintenanceTask(Base):
+    __tablename__ = "maintenance_tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    template_id: Mapped[int] = mapped_column(ForeignKey("maintenance_templates.id"))
+    due_date: Mapped[str] = mapped_column(String)
+    assignee_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    state: Mapped[str] = mapped_column(String, default="open")
+    completed_at: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    completion_reason: Mapped[str] = mapped_column(Text, default="")
+    calendar_entry_id: Mapped[Optional[int]] = mapped_column(ForeignKey("calendar_entries.id"), nullable=True, unique=True)
     created_at: Mapped[str] = mapped_column(String)

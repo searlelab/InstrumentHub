@@ -14,6 +14,7 @@ from .db import Database
 from .models import User
 from .services import break_glass_reset_admin_password, create_user
 from .ops import create_backup, restore_backup, verify_database
+from .notifications import deliver_pending
 
 
 def bootstrap_admin(settings: Settings) -> int:
@@ -99,6 +100,8 @@ def main() -> int:
     restore = subparsers.add_parser("restore", help="Restore a verified backup while the app service is stopped")
     restore.add_argument("path", type=Path)
     restore.add_argument("--confirm-restore", action="store_true")
+    deliver = subparsers.add_parser("deliver-notifications", help="Deliver a bounded batch of queued notification emails")
+    deliver.add_argument("--limit", type=int, default=100)
     args = parser.parse_args()
     try:
         settings = Settings.from_env()
@@ -124,6 +127,12 @@ def main() -> int:
                 return 2
             safety = restore_backup(settings, args.path)
             print(f"Pre-restore safety backup: {safety}" if safety else "Restore completed without a safety backup because the previous database was missing or corrupt.")
+            return 0
+        if args.command == "deliver-notifications":
+            database = Database(settings)
+            with database.session() as db:
+                result = deliver_pending(db, settings, limit=args.limit)
+            print(" ".join(f"{key}={value}" for key, value in result.items()))
             return 0
     except (ValueError, sqlite3.Error) as exc:
         print(str(exc), file=sys.stderr)

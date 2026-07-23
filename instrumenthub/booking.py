@@ -12,6 +12,7 @@ from .rules import RuleResult, estimate_duration_minutes, evaluate_booking, over
 from .scheduling import Slot, prune_expired_holds, prune_expired_tentatives, reservation_overlap, reserve_slots, slots_for_range
 from .security import hash_token, parse_utc, utc_text, utcnow
 from .services import audit, get_setting, require_active_admin
+from .notifications import enqueue_notification
 
 
 def configured_slots(db: Session, instrument_id: int, start_text: str, count: int) -> list[Slot]:
@@ -110,7 +111,8 @@ def submit_booking(
     grant_id: int | None, experiment_code: str, expected_minutes: int | None,
     injection_count: int | None, gradient_minutes: int | None, sample_category: str,
     description: str = "", admin_notes: str = "", override_required: bool = False,
-    request_id: str = "", expected_instrument_id: int | None = None,
+    request_id: str = "", expected_instrument_id: int | None = None, column_setup: str = "",
+    libraries_present: bool = False, gradient_minutes_value: int | None = None,
 ) -> tuple[Booking, list[RuleResult]]:
     _serialize_hold_write(db)
     user = db.get(User, user.id)
@@ -146,9 +148,10 @@ def submit_booking(
         raise ValueError(" ".join(result.message for result in results if result.severity == "blocked"))
     state = "tentative" if outcome == "approval_required" else "confirmed"
     entry.entry_type = "booking"; entry.state = state; entry.title = experiment_code.strip(); entry.updated_at = utc_text()
-    booking = Booking(calendar_entry_id=entry.id, user_id=user.id, pi_id=pi_id, project_id=project_id, grant_id=grant_id, experiment_code=experiment_code.strip(), expected_minutes=expected_minutes, sample_category=sample_category.strip(), description=description.strip(), admin_notes=admin_notes.strip(), override_required=override_required, requested_start=rows[0].slot_start, requested_end=rows[-1].slot_end)
+    booking = Booking(calendar_entry_id=entry.id, user_id=user.id, pi_id=pi_id, project_id=project_id, grant_id=grant_id, experiment_code=experiment_code.strip(), expected_minutes=expected_minutes, sample_category=sample_category.strip(), description=description.strip(), admin_notes=admin_notes.strip(), override_required=override_required, requested_start=rows[0].slot_start, requested_end=rows[-1].slot_end, column_setup=column_setup.strip(), libraries_present=libraries_present, gradient_minutes=gradient_minutes_value, reserved_minutes=sum(row.nominal_minutes for row in rows))
     db.add(booking); db.delete(hold); db.flush()
     audit(db, "created", "booking", booking.id, actor_user_id=user.id, after={"state": state, "rules": [result.as_dict() for result in results]}, request_id=request_id)
+    enqueue_notification(db, recipient_user_id=user.id, event_key=f"booking:{booking.id}:created", title="Booking confirmed" if state == "confirmed" else "Booking pending approval", body=f"{booking.experiment_code} is {state}.", link=f"/entries/{entry.id}")
     return booking, results
 
 

@@ -5,6 +5,7 @@
     <h1>{{ month_label }}</h1>
     <p>Times shown in {{ timezone }}. Click and drag across open blocks to hold consecutive time.</p>
   </div>
+  {% if current_handler %}<p class="notice">Current user: {{ current_handler.display_name }} · {{ current_handler.email }} {{ current_handler.phone }}</p>{% else %}<p class="notice">No active user is scheduled on this instrument.</p>{% endif %}
   <nav class="instrument-switch">
     {% for item in instruments %}<a data-accent="{{ loop.index0 }}" class="{% if item.id == instrument.id %}active{% endif %}" href="/calendar?instrument_id={{ item.id }}&month={{ month }}">{{ item.name }}</a>{% endfor %}
   </nav>

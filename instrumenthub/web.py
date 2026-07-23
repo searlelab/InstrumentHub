@@ -4,6 +4,8 @@ import json
 import logging
 import uuid
 import time
+import csv
+import io
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -13,7 +15,7 @@ from typing import Annotated, Any
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select, text
@@ -41,6 +43,9 @@ from .models import (
     SessionRecord,
     User,
     UserProject,
+    Notification,
+    MaintenanceTemplate,
+    MaintenanceTask,
 )
 from .security import cleanup_login_attempts, cleanup_sessions, create_session, hash_token, parse_utc, resolve_session, revoke_user_sessions, utc_text, utcnow, verify_password
 from .services import audit, complete_setup, create_user, replace_block_definitions, reset_user_password, setup_complete
@@ -50,6 +55,9 @@ from .booking import acquire_hold, clear_wizard_state, release_hold, release_hol
 from .rules import RuleResult, allotment_balances, evaluate_booking, estimate_duration_minutes
 from .management import apply_schedule_draft, cancel_booking, decide_booking, edit_booking, owner_can_manage_booking, preview_outage, preview_resume, recover_unknown_outage, transition_booking
 from .logging_config import configure_logging
+from .notifications import mark_read, unread_count
+from .maintenance_tasks import assign_task, complete_task, create_template, generate_due_tasks, schedule_task, set_template_active
+from .reporting import csv_safe, usage_report
 
 LOGGER = logging.getLogger("instrumenthub")
 PACKAGE_DIR = Path(__file__).parent
@@ -81,7 +89,7 @@ def _request_user(user: User) -> RequestUser:
 
 
 def _context(request: Request, **values: Any) -> dict[str, Any]:
-    return {"request": request, "user": getattr(request.state, "user", None), "csrf_token": getattr(request.state, "csrf_token", ""), **values}
+    return {"request": request, "user": getattr(request.state, "user", None), "csrf_token": getattr(request.state, "csrf_token", ""), "unread_notifications": getattr(request.state, "unread_notifications", 0), **values}
 
 
 def _redirect(path: str, status_code: int = 303) -> RedirectResponse:
@@ -143,6 +151,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request.state.request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))[:128]
         request.state.user = None
         request.state.csrf_token = ""
+        request.state.unread_notifications = 0
         try:
             with database.session() as db:
                 resolved = resolve_session(
@@ -155,6 +164,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     user, session_record = resolved
                     request.state.user = _request_user(user)
                     request.state.csrf_token = session_record.csrf_token
+                    request.state.unread_notifications = unread_count(db, user.id)
             response = await call_next(request)
         except Exception:
             request.state.user = None
@@ -617,8 +627,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             slots_by_day: dict[str, list[dict[str, object]]] = {}
             for slot in slots:
                 slots_by_day.setdefault(str(slot["date"]), []).append(slot)
+            current = db.execute(select(Booking, User).join(CalendarEntry, CalendarEntry.id == Booking.calendar_entry_id).join(ReservedSlot, ReservedSlot.calendar_entry_id == CalendarEntry.id).join(User, User.id == Booking.user_id).where(CalendarEntry.instrument_id == instrument.id, CalendarEntry.state.in_(["confirmed", "active"]), ReservedSlot.slot_start <= utc_text(), ReservedSlot.slot_end > utc_text()).order_by(ReservedSlot.slot_start).limit(1)).first()
             accent_index = list(instruments).index(instrument)
-            values = dict(instruments=instruments, instrument=instrument, accent_index=accent_index, month=month_value, month_label=datetime(year, month_number, 1).strftime("%B %Y"), selected_month=month_number, days=days, slots_by_day=slots_by_day, timezone=get_setting(db, "timezone", "UTC"), previous_month=adjacent_month(year, month_number, -1), next_month=adjacent_month(year, month_number, 1))
+            values = dict(instruments=instruments, instrument=instrument, accent_index=accent_index, month=month_value, month_label=datetime(year, month_number, 1).strftime("%B %Y"), selected_month=month_number, days=days, slots_by_day=slots_by_day, timezone=get_setting(db, "timezone", "UTC"), previous_month=adjacent_month(year, month_number, -1), next_month=adjacent_month(year, month_number, 1), current_booking=current[0] if current else None, current_handler=current[1] if current else None)
         return templates.TemplateResponse(request, "calendar.html", _context(request, message=message, **values))
 
     @app.get("/api/calendar")
@@ -633,6 +644,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(404, "Instrument not found.")
             slots = calendar_data(db, instrument_id, year, month_number, get_setting(db, "timezone", "UTC") or "UTC")
         return {"instrument_id": instrument_id, "month": f"{year:04d}-{month_number:02d}", "slots": slots}
+
+    @app.get("/inbox", response_class=HTMLResponse)
+    def inbox_page(request: Request):
+        user = _require_user(request)
+        with database.session() as db:
+            notices = db.scalars(select(Notification).where(Notification.recipient_user_id == user.id).order_by(Notification.created_at.desc(), Notification.id.desc())).all()
+        return templates.TemplateResponse(request, "inbox.html", _context(request, notices=notices))
+
+    @app.post("/inbox/{notification_id}/read")
+    def inbox_read(request: Request, notification_id: int, csrf_token: Annotated[str, Form()]):
+        user = _require_user(request); _check_csrf(request, csrf_token)
+        try:
+            with database.session() as db:
+                mark_read(db, notification_id=notification_id, user_id=user.id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        return _redirect("/inbox")
 
     @app.post("/admin/maintenance")
     def maintenance_create(request: Request, csrf_token: Annotated[str, Form()], instrument_id: Annotated[int, Form()], start_date: Annotated[date, Form()], end_date: Annotated[date, Form()], kind: Annotated[str, Form()], reason: Annotated[str, Form()]):
@@ -656,9 +684,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             booking = db.scalar(select(Booking).where(Booking.calendar_entry_id == entry.id))
             maintenance = db.scalar(select(Maintenance).where(Maintenance.calendar_entry_id == entry.id))
             handler = db.get(User, booking.user_id) if booking else None
+            project = db.get(Project, booking.project_id) if booking else None
+            grant = db.get(Grant, booking.grant_id) if booking and booking.grant_id else None
             reserved_minutes = sum(slot.nominal_minutes for slot in slots)
         can_edit = bool(booking and (request.state.user.role == "admin" or (booking.user_id == request.state.user.id and entry.state in {"tentative", "confirmed"} and slots and parse_utc(slots[0].slot_start) > utcnow())))
-        return templates.TemplateResponse(request, "entry_detail.html", _context(request, entry=entry, instrument=instrument, slots=slots, booking=booking, maintenance=maintenance, handler=handler, can_edit=can_edit, reserved_minutes=reserved_minutes))
+        return templates.TemplateResponse(request, "entry_detail.html", _context(request, entry=entry, instrument=instrument, slots=slots, booking=booking, maintenance=maintenance, handler=handler, project=project, grant=grant, can_edit=can_edit, reserved_minutes=reserved_minutes))
 
     @app.get("/book/new", response_class=HTMLResponse)
     def booking_select(request: Request, instrument_id: int, slot_start: str, error: str = ""):
@@ -714,16 +744,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         expected_minutes: Annotated[str, Form()] = "", injection_count: Annotated[str, Form()] = "",
         gradient_minutes: Annotated[str, Form()] = "", description: Annotated[str, Form()] = "",
         admin_notes: Annotated[str, Form()] = "", override_required: Annotated[str | None, Form()] = None,
+        column_setup: Annotated[str, Form()] = "", libraries_present: Annotated[str | None, Form()] = None,
     ):
         user = _require_user(request); _check_csrf(request, csrf_token)
-        saved = {"pi_id": str(pi_id), "project_id": str(project_id), "instrument_id": str(instrument_id or ""), "grant_id": grant_id, "experiment_code": experiment_code, "expected_minutes": expected_minutes, "injection_count": injection_count, "gradient_minutes": gradient_minutes, "sample_category": sample_category, "description": description, "admin_notes": admin_notes, "override_required": bool(override_required)}
+        saved = {"pi_id": str(pi_id), "project_id": str(project_id), "instrument_id": str(instrument_id or ""), "grant_id": grant_id, "experiment_code": experiment_code, "expected_minutes": expected_minutes, "injection_count": injection_count, "gradient_minutes": gradient_minutes, "sample_category": sample_category, "description": description, "admin_notes": admin_notes, "override_required": bool(override_required), "column_setup": column_setup, "libraries_present": bool(libraries_present)}
         selected_instrument_id = instrument_id or 0
         try:
             with database.session() as db:
                 if not selected_instrument_id:
                     raise ValueError("The selected instrument is unavailable.")
                 token = request.cookies.get(_hold_cookie(selected_instrument_id), "")
-                booking, _results = submit_booking(db, hold_id=hold_id, token=token, user=user, pi_id=pi_id, project_id=project_id, grant_id=int(grant_id) if grant_id else None, experiment_code=experiment_code, expected_minutes=int(expected_minutes) if expected_minutes else None, injection_count=int(injection_count) if injection_count else None, gradient_minutes=int(gradient_minutes) if gradient_minutes else None, sample_category=sample_category, description=description, admin_notes=admin_notes, override_required=bool(override_required), request_id=request.state.request_id, expected_instrument_id=selected_instrument_id)
+                booking, _results = submit_booking(db, hold_id=hold_id, token=token, user=user, pi_id=pi_id, project_id=project_id, grant_id=int(grant_id) if grant_id else None, experiment_code=experiment_code, expected_minutes=int(expected_minutes) if expected_minutes else None, injection_count=int(injection_count) if injection_count else None, gradient_minutes=int(gradient_minutes) if gradient_minutes else None, sample_category=sample_category, description=description, admin_notes=admin_notes, override_required=bool(override_required), request_id=request.state.request_id, expected_instrument_id=selected_instrument_id, column_setup=column_setup, libraries_present=bool(libraries_present), gradient_minutes_value=int(gradient_minutes) if gradient_minutes else None)
                 clear_wizard_state(db, request.cookies.get("instrumenthub_session"))
                 entry_id = booking.calendar_entry_id
         except (ValueError, TypeError, IndexError) as exc:
@@ -814,11 +845,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return templates.TemplateResponse(request, "booking_edit.html", _context(request, booking=booking, entry=entry, block_count=block_count, schedule_editable=schedule_editable))
 
     @app.post("/bookings/{booking_id}/edit")
-    def booking_edit_submit(request: Request, booking_id: int, csrf_token: Annotated[str, Form()], experiment_code: Annotated[str, Form()], expected_minutes: Annotated[int, Form()], sample_category: Annotated[str, Form()], description: Annotated[str, Form()] = "", admin_notes: Annotated[str, Form()] = "", new_start: Annotated[str, Form()] = "", block_count: Annotated[int | None, Form()] = None, reason: Annotated[str, Form()] = ""):
+    def booking_edit_submit(request: Request, booking_id: int, csrf_token: Annotated[str, Form()], experiment_code: Annotated[str, Form()], expected_minutes: Annotated[int, Form()], sample_category: Annotated[str, Form()], description: Annotated[str, Form()] = "", admin_notes: Annotated[str, Form()] = "", column_setup: Annotated[str, Form()] = "", libraries_present: Annotated[bool, Form()] = False, gradient_minutes: Annotated[str, Form()] = "", new_start: Annotated[str, Form()] = "", block_count: Annotated[int | None, Form()] = None, reason: Annotated[str, Form()] = ""):
         actor = _require_user(request); _check_csrf(request, csrf_token)
         try:
             with database.session() as db:
-                edit_booking(db, booking_id=booking_id, actor=actor, experiment_code=experiment_code, expected_minutes=expected_minutes, sample_category=sample_category, description=description, admin_notes=admin_notes, new_start=new_start.strip() or None, block_count=block_count, reason=reason, request_id=request.state.request_id)
+                edit_booking(db, booking_id=booking_id, actor=actor, experiment_code=experiment_code, expected_minutes=expected_minutes, sample_category=sample_category, description=description, admin_notes=admin_notes, column_setup=column_setup, libraries_present=libraries_present, gradient_minutes=int(gradient_minutes) if gradient_minutes.strip() else None, new_start=new_start.strip() or None, block_count=block_count, reason=reason, request_id=request.state.request_id)
                 booking = db.get(Booking, booking_id); entry_id = booking.calendar_entry_id
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -840,6 +871,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _require_admin(request)
         with database.session() as db:
             prune_expired_holds(db)
+            generate_due_tasks(db)
             tentative = [(booking, entry, db.get(User, booking.user_id)) for booking, entry in db.execute(select(Booking, CalendarEntry).join(CalendarEntry, CalendarEntry.id == Booking.calendar_entry_id).where(CalendarEntry.state == "tentative")).all()]
             live_holds = db.execute(
                 select(Hold, CalendarEntry, User, Instrument)
@@ -856,7 +888,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     entry = db.get(CalendarEntry, item["entry_id"])
                     items.append({**item, "title": entry.title if entry else f"Entry {item['entry_id']}", "entry_type": entry.entry_type if entry else "unknown"})
                 draft_views.append(SimpleNamespace(draft=draft, outage_slots=payload.get("outage_slots", []), restart_at=payload.get("restart_at"), items=items))
-            values = dict(tentative=tentative, live_holds=live_holds, instruments=db.scalars(select(Instrument).where(Instrument.active.is_(True)).order_by(Instrument.name)).all(), draft_views=draft_views, audits=db.scalars(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(100)).all(), message=message)
+            users = db.scalars(select(User).where(User.active.is_(True)).order_by(User.display_name)).all()
+            templates_by_id = {item.id: item for item in db.scalars(select(MaintenanceTemplate)).all()}
+            users_by_id = {item.id: item for item in users}
+            task_views = [SimpleNamespace(task=task, title=templates_by_id[task.template_id].title if task.template_id in templates_by_id else f"Template {task.template_id}", assignee=users_by_id.get(task.assignee_user_id)) for task in db.scalars(select(MaintenanceTask).where(MaintenanceTask.state == "open").order_by(MaintenanceTask.due_date, MaintenanceTask.id)).all()]
+            values = dict(tentative=tentative, live_holds=live_holds, instruments=db.scalars(select(Instrument).where(Instrument.active.is_(True)).order_by(Instrument.name)).all(), draft_views=draft_views, audits=db.scalars(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(100)).all(), maintenance_templates=list(templates_by_id.values()), maintenance_tasks=task_views, users=users, message=message)
         return templates.TemplateResponse(request, "admin_schedule.html", _context(request, **values))
 
     @app.post("/admin/holds/{hold_id}/release")
@@ -876,6 +912,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             with database.session() as db: decide_booking(db, booking_id=booking_id, decision=decision, admin_id=admin.id, reason=reason, request_id=request.state.request_id)
         except ValueError as exc: raise HTTPException(409, str(exc)) from exc
         return _redirect("/admin/schedule")
+
+    @app.get("/admin/maintenance-tasks", response_class=HTMLResponse)
+    def maintenance_tasks_page(request: Request):
+        _require_admin(request)
+        with database.session() as db:
+            generate_due_tasks(db)
+            users = db.scalars(select(User).where(User.active.is_(True)).order_by(User.display_name)).all()
+            templates_by_id = {item.id: item for item in db.scalars(select(MaintenanceTemplate)).all()}
+            users_by_id = {item.id: item for item in users}
+            task_views = [SimpleNamespace(task=task, title=templates_by_id[task.template_id].title if task.template_id in templates_by_id else f"Template {task.template_id}", assignee=users_by_id.get(task.assignee_user_id)) for task in db.scalars(select(MaintenanceTask).where(MaintenanceTask.state == "open").order_by(MaintenanceTask.due_date, MaintenanceTask.id)).all()]
+            template_views = [SimpleNamespace(template=template, instrument=db.get(Instrument, template.instrument_id)) for template in templates_by_id.values()]
+            values = dict(instruments=db.scalars(select(Instrument).where(Instrument.active.is_(True)).order_by(Instrument.name)).all(), users=users, tasks=task_views, templates=template_views)
+        return templates.TemplateResponse(request, "maintenance_tasks.html", _context(request, **values))
 
     @app.post("/admin/bookings/{booking_id}/transition")
     def booking_transition(request: Request, booking_id: int, csrf_token: Annotated[str, Form()], new_state: Annotated[str, Form()], reason: Annotated[str, Form()]):
@@ -917,6 +966,76 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             with database.session() as db: apply_schedule_draft(db, draft_id=draft_id, admin_id=admin.id, request_id=request.state.request_id)
         except ValueError as exc: raise HTTPException(409, str(exc)) from exc
         return _redirect("/admin/schedule")
+
+    @app.post("/admin/maintenance/templates")
+    def maintenance_template_create(request: Request, csrf_token: Annotated[str, Form()], instrument_id: Annotated[int, Form()], title: Annotated[str, Form()], interval_days: Annotated[int, Form()], expected_minutes: Annotated[int, Form()], first_due_date: Annotated[date, Form()], assignee_user_id: Annotated[str, Form()] = ""):
+        admin = _require_admin(request); _check_csrf(request, csrf_token)
+        try:
+            with database.session() as db:
+                create_template(db, instrument_id=instrument_id, title=title, interval_days=interval_days, expected_minutes=expected_minutes, assignee_user_id=int(assignee_user_id) if assignee_user_id else None, first_due_date=first_due_date, admin_id=admin.id, request_id=request.state.request_id)
+                generate_due_tasks(db)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return _redirect("/admin/maintenance-tasks")
+
+    @app.post("/admin/maintenance/tasks/{task_id}")
+    def maintenance_task_finish(request: Request, task_id: int, csrf_token: Annotated[str, Form()], state: Annotated[str, Form()], reason: Annotated[str, Form()]):
+        admin = _require_admin(request); _check_csrf(request, csrf_token)
+        try:
+            with database.session() as db:
+                complete_task(db, task_id=task_id, state=state, reason=reason, admin_id=admin.id, request_id=request.state.request_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return _redirect("/admin/maintenance-tasks")
+
+    @app.post("/admin/maintenance/tasks/{task_id}/assign")
+    def maintenance_task_assign(request: Request, task_id: int, csrf_token: Annotated[str, Form()], assignee_user_id: Annotated[str, Form()] = "", reason: Annotated[str, Form()] = ""):
+        admin = _require_admin(request); _check_csrf(request, csrf_token)
+        try:
+            with database.session() as db:
+                assign_task(db, task_id=task_id, assignee_user_id=int(assignee_user_id) if assignee_user_id else None, reason=reason, admin_id=admin.id, request_id=request.state.request_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return _redirect("/admin/maintenance-tasks")
+
+    @app.post("/admin/maintenance/tasks/{task_id}/schedule")
+    def maintenance_task_schedule(request: Request, task_id: int, csrf_token: Annotated[str, Form()], start_date: Annotated[date, Form()], end_date: Annotated[date, Form()], reason: Annotated[str, Form()]):
+        admin = _require_admin(request); _check_csrf(request, csrf_token)
+        try:
+            with database.session() as db:
+                schedule_task(db, task_id=task_id, start_date=start_date, end_date=end_date, reason=reason, admin_id=admin.id, request_id=request.state.request_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return _redirect("/admin/maintenance-tasks")
+
+    @app.post("/admin/maintenance/templates/{template_id}/active")
+    def maintenance_template_active(request: Request, template_id: int, csrf_token: Annotated[str, Form()], active: Annotated[str, Form()], reason: Annotated[str, Form()]):
+        admin = _require_admin(request); _check_csrf(request, csrf_token)
+        try:
+            with database.session() as db:
+                set_template_active(db, template_id=template_id, active=active == "true", reason=reason, admin_id=admin.id, request_id=request.state.request_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return _redirect("/admin/maintenance-tasks")
+
+    @app.get("/admin/reports", response_class=HTMLResponse)
+    def reports_page(request: Request, start: date | None = None, end: date | None = None, grant_id: int | None = None, pi_id: int | None = None, project_id: int | None = None, user_id: int | None = None, instrument_id: int | None = None, state: str = ""):
+        _require_admin(request)
+        start, end = start or date.today().replace(month=1, day=1), end or date.today()
+        if end < start:
+            raise HTTPException(400, "End date must be on or after start date.")
+        with database.session() as db:
+            rows, totals, usage, allotments = usage_report(db, start=start, end=end, grant_id=grant_id, pi_id=pi_id, project_id=project_id, user_id=user_id, instrument_id=instrument_id, state=state)
+            values = dict(rows=rows, totals=totals, usage=usage, allotments=allotments, start=start, end=end, filters={"grant_id": grant_id, "pi_id": pi_id, "project_id": project_id, "user_id": user_id, "instrument_id": instrument_id, "state": state}, grants=db.scalars(select(Grant).order_by(Grant.number)).all(), pis=db.scalars(select(PI).order_by(PI.name)).all(), projects=db.scalars(select(Project).order_by(Project.code)).all(), users=db.scalars(select(User).order_by(User.display_name)).all(), instruments=db.scalars(select(Instrument).order_by(Instrument.name)).all())
+        return templates.TemplateResponse(request, "reports.html", _context(request, **values))
+
+    @app.get("/admin/reports.csv")
+    def reports_csv(request: Request, start: date, end: date, grant_id: int | None = None, pi_id: int | None = None, project_id: int | None = None, user_id: int | None = None, instrument_id: int | None = None, state: str = ""):
+        _require_admin(request)
+        with database.session() as db:
+            rows, _totals, _usage, _allotments = usage_report(db, start=start, end=end, grant_id=grant_id, pi_id=pi_id, project_id=project_id, user_id=user_id, instrument_id=instrument_id, state=state)
+        output = io.StringIO(); writer = csv.DictWriter(output, fieldnames=["start", "end", "state", "entry_type", "minutes", "minutes_source", "instrument", "user", "pi", "project", "grant", "experiment"]); writer.writeheader(); writer.writerows([{key: csv_safe(value) for key, value in row.items()} for row in rows])
+        return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=instrumenthub-usage.csv"})
 
     @app.get("/admin/operations", response_class=HTMLResponse)
     def operations_page(request: Request):

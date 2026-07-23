@@ -15,6 +15,12 @@ class Settings:
     session_idle_minutes: int = 480
     session_absolute_hours: int = 24
     backup_retention_days: int = 30
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_starttls: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -35,6 +41,12 @@ class Settings:
             session_idle_minutes=int(os.environ.get("INSTRUMENTHUB_SESSION_IDLE_MINUTES", "480")),
             session_absolute_hours=int(os.environ.get("INSTRUMENTHUB_SESSION_ABSOLUTE_HOURS", "24")),
             backup_retention_days=backup_retention_days,
+            smtp_host=os.environ.get("INSTRUMENTHUB_SMTP_HOST", "").strip(),
+            smtp_port=int(os.environ.get("INSTRUMENTHUB_SMTP_PORT", "587")),
+            smtp_username=os.environ.get("INSTRUMENTHUB_SMTP_USERNAME", ""),
+            smtp_password=os.environ.get("INSTRUMENTHUB_SMTP_PASSWORD", ""),
+            smtp_from=os.environ.get("INSTRUMENTHUB_SMTP_FROM", "").strip(),
+            smtp_starttls=os.environ.get("INSTRUMENTHUB_SMTP_STARTTLS", "true").lower() not in {"0", "false", "no"},
         )
 
     def ensure_directories(self) -> None:
