@@ -34,6 +34,7 @@ body { margin: 0; min-height: 100vh; }
 [data-accent="0"] { --accent: var(--tide); --accent-soft: #e2eef0; --accent-ink: #1b4b52; }
 [data-accent="1"] { --accent: var(--cedar-warm); --accent-soft: #f4e8df; --accent-ink: #7a4a2b; }
 [data-accent="2"] { --accent: var(--moss); --accent-soft: #e9efe0; --accent-ink: #46592f; }
+[data-accent="all"] { --accent: var(--evergreen); --accent-soft: #e4ece7; --accent-ink: var(--evergreen-deep); }
 
 /* ---- Header ---- */
 header {
@@ -130,6 +131,7 @@ code { background: var(--mist); padding: .1rem .3rem; border-radius: .25rem; }
 }
 .calendar-head h1 { margin-bottom: .1rem; }
 .calendar-head p { margin: 0; color: var(--slate); font-size: .9rem; }
+.calendar-current-user { flex: 1 1 20rem; min-height: 2.8rem; display: flex; align-items: center; }
 .instrument-switch { display: flex; gap: .5rem; flex-wrap: wrap; }
 .instrument-switch a {
   padding: .5rem .95rem; border-radius: 2rem; text-decoration: none; font-weight: 700;
@@ -189,6 +191,31 @@ code { background: var(--mist); padding: .1rem .3rem; border-radius: .25rem; }
 .calendar-day.outside .slot { opacity: .72; }
 .calendar-day.outside .slot.selected { opacity: 1; }
 
+/* Compact all-instruments overview. Each instrument gets one horizontal block strip
+   per day so a three-block schedule stays readable without three stacked cards. */
+.calendar-overview { touch-action: auto; }
+.calendar-overview .calendar-day { min-height: 10rem; gap: .45rem; }
+.overview-instrument { display: grid; gap: .2rem; }
+.overview-name { color: var(--evergreen); font-size: .72rem; font-weight: 700; text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.overview-name:hover { text-decoration: underline; }
+.overview-slots { display: flex; flex-wrap: wrap; gap: .2rem; }
+.overview-slot {
+  display: inline-flex; align-items: center; gap: .25rem; min-width: 0; padding: .18rem .3rem;
+  border: 1px solid var(--line); border-left: .3rem solid var(--slate); border-radius: .22rem;
+  background: #f7faf8; color: var(--ink); font-size: .67rem; line-height: 1.2; text-decoration: none;
+}
+.overview-slot strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.overview-slot span { color: var(--slate); font-weight: 700; }
+.overview-slot.available { border-left-color: var(--tide); background: #e2eef0; }
+.overview-slot.confirmed { border-left-color: var(--moss); background: #eaf2e3; }
+.overview-slot.tentative { border-left-color: #b7892f; background: repeating-linear-gradient(45deg, #fdf5e3, #fdf5e3 4px, #f7e9c9 4px, #f7e9c9 8px); }
+.overview-slot.held { border-left-color: var(--tide); background: repeating-linear-gradient(45deg, var(--accent-soft), var(--accent-soft) 4px, #d3e4e6 4px, #d3e4e6 8px); }
+.overview-slot.active { border-left-color: var(--tide-bright); background: #e3eff0; }
+.overview-slot.paused { border-left-color: #7a5aa6; background: #ece6f4; }
+.overview-slot.maintenance { border-left-color: #b23a2e; background: #f8ded9; }
+.overview-slot.outage { border-left-color: #33413d; background: #dfe5e2; }
+.overview-slot.past { border-left-color: var(--line); background: #f0f3f1; color: #9aa8a2; }
+
 /* ---- Slots ---- */
 .slot {
   display: grid; gap: .1rem; padding: .4rem .5rem; border-radius: var(--radius-sm);
@@ -196,6 +223,8 @@ code { background: var(--mist); padding: .1rem .3rem; border-radius: .25rem; }
   border-top: 1px solid var(--line); border-right: 1px solid var(--line); border-bottom: 1px solid var(--line);
 }
 .slot strong { font-size: .82rem; }
+.slot-title { display: flex; align-items: center; justify-content: space-between; gap: .4rem; }
+.slot .details-toggle { font-size: 1rem; line-height: 1; padding: 0 .1rem; }
 .slot span { color: var(--slate); }
 .slot a { color: var(--accent-ink); font-weight: 700; text-decoration: none; font-size: .78rem; }
 .slot a:hover { text-decoration: underline; }

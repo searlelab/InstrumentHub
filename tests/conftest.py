@@ -58,13 +58,21 @@ def configured(client, admin_csrf):
         data={
             "csrf_token": admin_csrf,
             "timezone": "America/Chicago",
-            "instrument_1_name": "Orbitrap A",
-            "instrument_1_blocks": "Morning,08:00,16:00\nNight,16:00,08:00",
-            "instrument_1_training": "yes",
-            "instrument_2_name": "Orbitrap B",
-            "instrument_2_blocks": "Day,07:00,19:00\nNight,19:00,07:00",
+            "instrument_name": "Orbitrap A",
+            "instrument_blocks": "Morning,08:00,16:00\nNight,16:00,08:00",
+            "instrument_training": "yes",
             "hold_minutes": "15",
             "tentative_expiration_days": "",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    response = client.post(
+        "/admin/instruments",
+        data={
+            "csrf_token": admin_csrf,
+            "name": "Orbitrap B",
+            "blocks": "Day,07:00,19:00\nNight,19:00,07:00",
         },
         follow_redirects=False,
     )

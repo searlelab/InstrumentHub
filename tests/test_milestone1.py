@@ -125,9 +125,8 @@ def test_range_guard_migration_rejects_preexisting_overlaps(tmp_path):
 def test_setup_rejects_overlapping_blocks(client):
     csrf = login(client)
     response = client.post("/setup", data={
-        "csrf_token": csrf, "timezone": "America/Chicago", "instrument_1_name": "A",
-        "instrument_1_blocks": "Long,16:00,08:00\nOverlap,00:00,07:00", "instrument_2_name": "B",
-        "instrument_2_blocks": "Day,08:00,16:00", "hold_minutes": "15", "tentative_expiration_days": "",
+        "csrf_token": csrf, "timezone": "America/Chicago", "instrument_name": "A",
+        "instrument_blocks": "Long,16:00,08:00\nOverlap,00:00,07:00", "hold_minutes": "15", "tentative_expiration_days": "",
     })
     assert response.status_code == 400
     assert "overlap" in response.text.lower()
@@ -140,9 +139,8 @@ def test_setup_and_scheduling_use_bundled_tzdata_without_system_zoneinfo(client,
     zoneinfo.reset_tzpath(to=())
     try:
         response = client.post("/setup", data={
-            "csrf_token": csrf, "timezone": "America/Chicago", "instrument_1_name": "A",
-            "instrument_1_blocks": "Day,08:00,16:00", "instrument_2_name": "B",
-            "instrument_2_blocks": "Day,08:00,16:00", "hold_minutes": "15", "tentative_expiration_days": "",
+            "csrf_token": csrf, "timezone": "America/Chicago", "instrument_name": "A",
+            "instrument_blocks": "Day,08:00,16:00", "hold_minutes": "15", "tentative_expiration_days": "",
         }, follow_redirects=False)
         assert response.status_code == 303
         with app.state.database.session() as db:
@@ -152,16 +150,17 @@ def test_setup_and_scheduling_use_bundled_tzdata_without_system_zoneinfo(client,
         zoneinfo.reset_tzpath(to=original_tzpath)
 
 
-def test_authentication_setup_gate_and_exactly_two_instruments(client):
+def test_authentication_setup_gate_and_single_instrument(client, app):
     assert client.get("/").status_code == 200  # redirected to login and followed
     csrf = login(client)
     assert client.get("/", follow_redirects=False).headers["location"] == "/setup"
-    bad = client.post("/setup", data={
-        "csrf_token": csrf, "timezone": "America/Chicago", "instrument_1_name": "A",
-        "instrument_1_blocks": "Day,08:00,16:00", "instrument_2_name": "A",
-        "instrument_2_blocks": "Day,08:00,16:00", "hold_minutes": "15", "tentative_expiration_days": "",
-    })
-    assert bad.status_code == 400
+    response = client.post("/setup", data={
+        "csrf_token": csrf, "timezone": "America/Chicago", "instrument_name": "A",
+        "instrument_blocks": "Day,08:00,16:00", "hold_minutes": "15", "tentative_expiration_days": "",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    with app.state.database.session() as db:
+        assert db.scalar(select(func.count()).select_from(Instrument)) == 1
 
 
 def test_setup_explains_training_and_tentative_expiry(client):
@@ -171,15 +170,56 @@ def test_setup_explains_training_and_tentative_expiry(client):
     assert "automatically cancel unapproved requests" in page.text
 
 
+def test_instrument_creation_is_unavailable_until_setup(client, app):
+    csrf = login(client)
+    page = client.get("/admin")
+    assert "Add instrument" not in page.text
+    response = client.post("/admin/instruments", data={"csrf_token": csrf, "name": "Sneaky", "blocks": "Gap,02:30,04:00"})
+    assert response.status_code == 400
+    assert "Complete initial setup" in response.text
+    with app.state.database.session() as db:
+        assert db.scalar(select(func.count()).select_from(Instrument)) == 0
+
+
 def test_setup_persists_and_cannot_repeat(client, configured, app):
     with app.state.database.session() as db:
         assert db.scalar(select(func.count()).select_from(Instrument)) == 2
     assert client.get("/setup", follow_redirects=False).headers["location"] == "/admin"
 
 
+def test_admin_can_add_instrument_and_calendar_overview_uses_active_instruments(client, configured, app):
+    csrf = client.get("/admin").text.split('name="csrf_token" value="')[1].split('"')[0]
+    created = client.post("/admin/instruments", data={"csrf_token": csrf, "name": "Orbitrap C", "blocks": "Day,08:00,16:00", "training_required": "yes"}, follow_redirects=False)
+    assert created.status_code == 303
+    overview = client.get("/calendar?view=all")
+    assert overview.status_code == 200
+    assert "All instruments" in overview.text
+    assert "Orbitrap C" in overview.text
+    assert "data-calendar-overview" in overview.text
+    assert "Hold selected blocks" not in overview.text
+    assert 'data-accent="all"' in overview.text
+    assert 'data-accent="0"' in overview.text
+    assert 'data-accent="1"' in overview.text
+    assert "calendar-current-user" in overview.text
+    payload = client.get(f"/api/calendar?view=all&month={date.today():%Y-%m}").json()
+    assert payload["view"] == "all"
+    assert {slot["instrument_id"] for slot in payload["slots"]} >= {1, 2, 3}
+    duplicate = client.post("/admin/instruments", data={"csrf_token": csrf, "name": "Orbitrap C", "blocks": "Day,08:00,16:00"})
+    assert duplicate.status_code == 400
+    assert client.post("/admin/instruments", data={"name": "Orbitrap D", "blocks": "Day,08:00,16:00"}).status_code in {403, 422}
+    with app.state.database.session() as db:
+        instrument = db.scalar(select(Instrument).where(Instrument.name == "Orbitrap C"))
+        assert instrument.training_required
+        instrument.active = False
+    hidden = client.get("/calendar?view=all")
+    assert "Orbitrap C" not in hidden.text
+
+
 def test_user_cannot_access_admin(client):
-    login(client, "member", "correct-horse-member!")
+    csrf = login(client, "member", "correct-horse-member!")
     response = client.get("/admin")
+    assert response.status_code == 403
+    response = client.post("/admin/instruments", data={"csrf_token": csrf, "name": "Unauthorized", "blocks": "Day,08:00,16:00"})
     assert response.status_code == 403
 
 

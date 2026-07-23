@@ -6,6 +6,7 @@ from datetime import date
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .models import AppSetting, AuditEvent, BlockDefinition, Booking, CalendarEntry, Instrument, ReservedSlot, User
@@ -213,6 +214,57 @@ def parse_blocks(text: str) -> list[tuple[str, str, str]]:
     return sorted(blocks, key=lambda block: (int(block[1][:2]), int(block[1][3:])))
 
 
+def create_instrument(
+    db: Session,
+    *,
+    name: str,
+    blocks_text: str,
+    timezone: str,
+    training_required: bool,
+    actor_user_id: int,
+    request_id: str = "",
+) -> Instrument:
+    """Create one immediately schedulable instrument and its initial block version."""
+    require_active_admin(db, actor_user_id)
+    name = name.strip()
+    if not name:
+        raise ValueError("Instrument name is required.")
+    if not timezone.strip():
+        raise ValueError("A configured lab timezone is required.")
+    if db.scalar(select(Instrument.id).where(func.lower(Instrument.name) == name.lower())):
+        raise ValueError("An instrument with that name already exists.")
+    blocks = parse_blocks(blocks_text)
+    from .scheduling import validate_block_boundaries
+
+    effective_from = date.today()
+    validate_block_boundaries(blocks, timezone=timezone, effective_from=effective_from)
+    instrument = Instrument(name=name, active=True, training_required=training_required, unavailable=False)
+    db.add(instrument)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        raise ValueError("An instrument with that name already exists.") from exc
+    for index, (block_name, start, end) in enumerate(blocks):
+        db.add(BlockDefinition(
+            instrument_id=instrument.id,
+            name=block_name,
+            start_time=start,
+            end_time=end,
+            effective_from=effective_from.isoformat(),
+            sort_order=index,
+        ))
+    audit(
+        db,
+        "created",
+        "instrument",
+        instrument.id,
+        actor_user_id=actor_user_id,
+        after={"name": instrument.name, "training_required": instrument.training_required, "blocks": [item[0] for item in blocks]},
+        request_id=request_id,
+    )
+    return instrument
+
+
 def replace_block_definitions(db: Session, *, instrument_id: int, effective_from: date, blocks_text: str, actor_user_id: int, request_id: str = "") -> None:
     from datetime import timedelta
     from zoneinfo import ZoneInfo
@@ -273,25 +325,20 @@ def complete_setup(
         ZoneInfo(timezone)
     except ZoneInfoNotFoundError as exc:
         raise ValueError("Unknown IANA timezone.") from exc
-    if len(instruments) != 2 or len({item["name"].strip().lower() for item in instruments}) != 2:
-        raise ValueError("Exactly two instruments with distinct names are required.")
+    if len(instruments) != 1:
+        raise ValueError("Exactly one initial instrument is required.")
     if not 5 <= hold_minutes <= 60:
         raise ValueError("Hold duration must be between 5 and 60 minutes.")
-    effective = date.today().isoformat()
     for instrument_data in instruments:
-        blocks = parse_blocks(instrument_data["blocks"])
-        from .scheduling import validate_block_boundaries
-        validate_block_boundaries(blocks, timezone=timezone, effective_from=date.today())
-        instrument = Instrument(
-            name=instrument_data["name"].strip(),
-            active=True,
+        create_instrument(
+            db,
+            name=instrument_data["name"],
+            blocks_text=instrument_data["blocks"],
+            timezone=timezone,
             training_required=bool(instrument_data.get("training_required")),
-            unavailable=False,
+            actor_user_id=actor_user_id,
+            request_id=request_id,
         )
-        db.add(instrument)
-        db.flush()
-        for index, (name, start, end) in enumerate(blocks):
-            db.add(BlockDefinition(instrument_id=instrument.id, name=name, start_time=start, end_time=end, effective_from=effective, sort_order=index))
     set_setting(db, "timezone", timezone)
     set_setting(db, "hold_minutes", str(hold_minutes))
     set_setting(db, "tentative_expiration_days", "" if tentative_expiration_days is None else str(tentative_expiration_days))

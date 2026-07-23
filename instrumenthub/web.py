@@ -48,9 +48,9 @@ from .models import (
     MaintenanceTask,
 )
 from .security import cleanup_login_attempts, cleanup_sessions, create_session, hash_token, parse_utc, resolve_session, revoke_user_sessions, utc_text, utcnow, verify_password
-from .services import audit, complete_setup, create_user, replace_block_definitions, reset_user_password, setup_complete
+from .services import audit, complete_setup, create_instrument, create_user, replace_block_definitions, reset_user_password, setup_complete
 from .services import get_setting
-from .scheduling import calendar_data, create_maintenance, month_days, prune_expired_holds
+from .scheduling import calendar_data, create_maintenance, month_days, prune_expired_holds, prune_expired_tentatives
 from .booking import acquire_hold, clear_wizard_state, release_hold, release_hold_as_admin, resolve_hold, save_wizard_state, slot_values, submit_booking
 from .rules import RuleResult, allotment_balances, evaluate_booking, estimate_duration_minutes
 from .management import apply_schedule_draft, cancel_booking, decide_booking, edit_booking, owner_can_manage_booking, preview_outage, preview_resume, recover_unknown_outage, transition_booking
@@ -277,10 +277,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def setup_submit(
         request: Request,
         csrf_token: Annotated[str, Form()], timezone: Annotated[str, Form()],
-        instrument_1_name: Annotated[str, Form()], instrument_1_blocks: Annotated[str, Form()],
-        instrument_2_name: Annotated[str, Form()], instrument_2_blocks: Annotated[str, Form()],
+        instrument_name: Annotated[str, Form()], instrument_blocks: Annotated[str, Form()],
         hold_minutes: Annotated[int, Form()] = 15, tentative_expiration_days: Annotated[str, Form()] = "",
-        instrument_1_training: Annotated[str | None, Form()] = None, instrument_2_training: Annotated[str | None, Form()] = None,
+        instrument_training: Annotated[str | None, Form()] = None,
     ):
         admin = _require_admin(request)
         _check_csrf(request, csrf_token)
@@ -290,8 +289,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 complete_setup(
                     db, timezone=timezone, hold_minutes=hold_minutes, tentative_expiration_days=expiration,
                     instruments=[
-                        {"name": instrument_1_name, "blocks": instrument_1_blocks, "training_required": bool(instrument_1_training)},
-                        {"name": instrument_2_name, "blocks": instrument_2_blocks, "training_required": bool(instrument_2_training)},
+                        {"name": instrument_name, "blocks": instrument_blocks, "training_required": bool(instrument_training)},
                     ], actor_user_id=admin.id, request_id=request.state.request_id,
                 )
             return _redirect("/admin")
@@ -597,6 +595,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(400, str(exc)) from exc
         return _redirect("/admin?message=Future+block+version+created")
 
+    @app.post("/admin/instruments")
+    def admin_create_instrument(
+        request: Request,
+        csrf_token: Annotated[str, Form()],
+        name: Annotated[str, Form()],
+        blocks: Annotated[str, Form()],
+        training_required: Annotated[str | None, Form()] = None,
+    ):
+        admin = _require_admin(request); _check_csrf(request, csrf_token)
+        try:
+            with database.session() as db:
+                if not setup_complete(db):
+                    raise ValueError("Complete initial setup before adding instruments.")
+                timezone = get_setting(db, "timezone")
+                if not timezone:
+                    raise ValueError("A configured lab timezone is required.")
+                create_instrument(
+                    db,
+                    name=name,
+                    blocks_text=blocks,
+                    timezone=timezone,
+                    training_required=bool(training_required),
+                    actor_user_id=admin.id,
+                    request_id=request.state.request_id,
+                )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return _redirect("/admin?message=Instrument+created")
+
     def selected_month(value: str) -> tuple[int, int]:
         try:
             parsed = datetime.strptime(value, "%Y-%m") if value else datetime.now()
@@ -611,39 +638,65 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return f"{index // 12:04d}-{index % 12 + 1:02d}"
 
     @app.get("/calendar", response_class=HTMLResponse)
-    def calendar_page(request: Request, instrument_id: int | None = None, month: str = "", message: str = ""):
+    def calendar_page(request: Request, instrument_id: int | None = None, month: str = "", view: str = "", message: str = ""):
         _require_user(request)
+        if view not in {"", "all"}:
+            raise HTTPException(400, "Calendar view must be an instrument or all instruments.")
         with database.session() as db:
             if not setup_complete(db):
                 return _redirect("/setup-required")
             instruments = db.scalars(select(Instrument).where(Instrument.active.is_(True)).order_by(Instrument.name)).all()
-            instrument = db.get(Instrument, instrument_id) if instrument_id else (instruments[0] if instruments else None)
-            if not instrument or instrument not in instruments:
-                raise HTTPException(404, "Instrument not found.")
             year, month_number = selected_month(month)
             month_value = f"{year:04d}-{month_number:02d}"
             days = month_days(year, month_number)
-            slots = calendar_data(db, instrument.id, year, month_number, get_setting(db, "timezone", "UTC") or "UTC")
-            slots_by_day: dict[str, list[dict[str, object]]] = {}
-            for slot in slots:
-                slots_by_day.setdefault(str(slot["date"]), []).append(slot)
-            current = db.execute(select(Booking, User).join(CalendarEntry, CalendarEntry.id == Booking.calendar_entry_id).join(ReservedSlot, ReservedSlot.calendar_entry_id == CalendarEntry.id).join(User, User.id == Booking.user_id).where(CalendarEntry.instrument_id == instrument.id, CalendarEntry.state.in_(["confirmed", "active"]), ReservedSlot.slot_start <= utc_text(), ReservedSlot.slot_end > utc_text()).order_by(ReservedSlot.slot_start).limit(1)).first()
-            accent_index = list(instruments).index(instrument)
-            values = dict(instruments=instruments, instrument=instrument, accent_index=accent_index, month=month_value, month_label=datetime(year, month_number, 1).strftime("%B %Y"), selected_month=month_number, days=days, slots_by_day=slots_by_day, timezone=get_setting(db, "timezone", "UTC"), previous_month=adjacent_month(year, month_number, -1), next_month=adjacent_month(year, month_number, 1), current_booking=current[0] if current else None, current_handler=current[1] if current else None)
+            timezone = get_setting(db, "timezone", "UTC") or "UTC"
+            common = dict(instruments=instruments, all_instruments=view == "all", month=month_value, month_label=datetime(year, month_number, 1).strftime("%B %Y"), selected_month=month_number, days=days, timezone=timezone, previous_month=adjacent_month(year, month_number, -1), next_month=adjacent_month(year, month_number, 1))
+            if view == "all":
+                prune_expired_holds(db)
+                prune_expired_tentatives(db)
+                overview_by_day: dict[str, list[dict[str, object]]] = {day.isoformat(): [] for day in days}
+                for item in instruments:
+                    by_day: dict[str, list[dict[str, object]]] = {}
+                    for slot in calendar_data(db, item.id, year, month_number, timezone, prune=False):
+                        by_day.setdefault(str(slot["date"]), []).append(slot)
+                    for day in days:
+                        overview_by_day[day.isoformat()].append({"instrument": item, "slots": by_day.get(day.isoformat(), [])})
+                values = dict(common, overview_by_day=overview_by_day)
+            else:
+                instrument = db.get(Instrument, instrument_id) if instrument_id else (instruments[0] if instruments else None)
+                if not instrument or instrument not in instruments:
+                    raise HTTPException(404, "Instrument not found.")
+                slots_by_day: dict[str, list[dict[str, object]]] = {}
+                for slot in calendar_data(db, instrument.id, year, month_number, timezone):
+                    slots_by_day.setdefault(str(slot["date"]), []).append(slot)
+                current = db.execute(select(Booking, User).join(CalendarEntry, CalendarEntry.id == Booking.calendar_entry_id).join(ReservedSlot, ReservedSlot.calendar_entry_id == CalendarEntry.id).join(User, User.id == Booking.user_id).where(CalendarEntry.instrument_id == instrument.id, CalendarEntry.state.in_(["confirmed", "active"]), ReservedSlot.slot_start <= utc_text(), ReservedSlot.slot_end > utc_text()).order_by(ReservedSlot.slot_start).limit(1)).first()
+                values = dict(common, instrument=instrument, accent_index=list(instruments).index(instrument), slots_by_day=slots_by_day, current_booking=current[0] if current else None, current_handler=current[1] if current else None)
         return templates.TemplateResponse(request, "calendar.html", _context(request, message=message, **values))
 
     @app.get("/api/calendar")
-    def calendar_api(request: Request, instrument_id: int, month: str):
+    def calendar_api(request: Request, month: str, instrument_id: int | None = None, view: str = ""):
         _require_user(request)
+        if view not in {"", "all"}:
+            raise HTTPException(400, "Calendar view must be an instrument or all instruments.")
         year, month_number = selected_month(month)
         with database.session() as db:
             if not setup_complete(db):
                 return _redirect("/setup-required")
+            timezone = get_setting(db, "timezone", "UTC") or "UTC"
+            if view == "all":
+                prune_expired_holds(db)
+                prune_expired_tentatives(db)
+                slots = []
+                for instrument in db.scalars(select(Instrument).where(Instrument.active.is_(True)).order_by(Instrument.name)).all():
+                    slots.extend({**slot, "instrument_id": instrument.id} for slot in calendar_data(db, instrument.id, year, month_number, timezone, prune=False))
+                return {"view": "all", "month": f"{year:04d}-{month_number:02d}", "slots": slots}
+            if instrument_id is None:
+                raise HTTPException(400, "An instrument is required for an individual calendar view.")
             instrument = db.get(Instrument, instrument_id)
             if not instrument or not instrument.active:
                 raise HTTPException(404, "Instrument not found.")
-            slots = calendar_data(db, instrument_id, year, month_number, get_setting(db, "timezone", "UTC") or "UTC")
-        return {"instrument_id": instrument_id, "month": f"{year:04d}-{month_number:02d}", "slots": slots}
+            slots = calendar_data(db, instrument.id, year, month_number, timezone)
+        return {"instrument_id": instrument.id, "month": f"{year:04d}-{month_number:02d}", "slots": slots}
 
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox_page(request: Request):

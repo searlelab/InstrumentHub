@@ -35,6 +35,11 @@ def test_calendar_requires_authentication(client, configured):
     assert response.status_code == 303
 
 
+def test_calendar_api_requires_an_individual_instrument(client, configured):
+    response = client.get("/api/calendar?month=2026-08")
+    assert response.status_code == 400
+
+
 def test_calendar_renders_both_instruments_and_local_blocks(client, configured):
     response = client.get("/calendar?month=2026-08")
     assert response.status_code == 200
@@ -83,6 +88,22 @@ def test_calendar_includes_booking_handler_initials(client, app, configured):
     assert "OPS-28 · LM" in page.text
     slots = client.get(f"/api/calendar?instrument_id=2&month={month}").json()["slots"]
     assert next(slot for slot in slots if slot["title"] == "OPS-28")["handler_initials"] == "LM"
+
+
+def test_overview_links_confirmed_entries_but_not_holds(client, app, configured):
+    _booking_id, entry_id, start = make_booking(app, days=14)
+    with app.state.database.session() as db:
+        member = db.scalar(select(User).where(User.username == "member"))
+        slot = slots_for_date(db, 1, date.today() + timedelta(days=15), "America/Chicago")[0]
+        hold, _token, _slots = acquire_hold(db, user=member, instrument_id=1, start_text=slot.start_text, count=1)
+        hold_entry_id = hold.calendar_entry_id
+    page = client.get(f"/calendar?view=all&month={start[:7]}")
+    assert f'href="/entries/{entry_id}"' in page.text
+    assert "overview-slot confirmed" in page.text
+    assert "OPS-14" in page.text
+    assert "LM</span>" in page.text
+    assert f'href="/entries/{hold_entry_id}"' not in page.text
+    assert "overview-slot held" in page.text
 
 
 def test_block_and_maintenance_services_require_an_active_administrator(app, configured):

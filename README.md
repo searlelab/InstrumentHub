@@ -6,7 +6,7 @@ Designed for a small lab deployment, InstrumentHub runs as a single FastAPI appl
 
 ## What it does
 
-- Shows authenticated, fixed-block calendars for two instruments.
+- Shows authenticated, fixed-block calendars for one or more instruments, including a compact all-instruments overview.
 - Prevents double booking with transactional holds and database-backed slot uniqueness.
 - Guides members through booking details, duration estimates, projects, grants, and rule checks.
 - Applies configurable training, allotment, consecutive-time, and approval policies.
@@ -47,7 +47,7 @@ python -m instrumenthub bootstrap-admin
 python -m instrumenthub serve
 ```
 
-Open <http://127.0.0.1:8000>, sign in with the first administrator, and complete the setup flow. Setup establishes the lab timezone, exactly two instruments, their fixed booking blocks, hold policy, tentative-expiry policy, and training requirements.
+Open <http://127.0.0.1:8000>, sign in with the first administrator, and complete the setup flow. Setup establishes the lab timezone, one initial instrument and its fixed booking blocks, hold policy, tentative-expiry policy, and training requirements. Administrators can add further instruments individually later.
 
 On Windows PowerShell, use:
 
@@ -133,7 +133,7 @@ Operational endpoints are available locally at `/health` and `/ready`. The readi
 
 ## Scope
 
-InstrumentHub focuses on reliable local scheduling for two shared instruments, with local notifications, recurring maintenance operations, and administrator reporting. External calendar integrations, waitlists, automatic placement, preferred-instrument queues, workstation scheduling, sample-compatibility enforcement, and a PI self-service portal remain out of scope.
+InstrumentHub focuses on reliable local scheduling for shared instruments, with local notifications, recurring maintenance operations, and administrator reporting. External calendar integrations, waitlists, automatic placement, preferred-instrument queues, workstation scheduling, sample-compatibility enforcement, and a PI self-service portal remain out of scope.
 
 ## License
 

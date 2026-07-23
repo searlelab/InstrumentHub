@@ -159,9 +159,10 @@ def reserve_slots(db: Session, entry: CalendarEntry, slots: list[Slot]) -> None:
         raise ValueError("One or more selected instrument blocks are no longer available.") from exc
 
 
-def calendar_data(db: Session, instrument_id: int, year: int, month: int, timezone: str) -> list[dict[str, object]]:
-    prune_expired_holds(db)
-    prune_expired_tentatives(db)
+def calendar_data(db: Session, instrument_id: int, year: int, month: int, timezone: str, *, prune: bool = True) -> list[dict[str, object]]:
+    if prune:
+        prune_expired_holds(db)
+        prune_expired_tentatives(db)
     days = month_days(year, month)
     slots = slots_for_range(db, instrument_id, days[0], days[-1], timezone)
     query = select(ReservedSlot, CalendarEntry, Booking, User).join(CalendarEntry, CalendarEntry.id == ReservedSlot.calendar_entry_id).outerjoin(Booking, Booking.calendar_entry_id == CalendarEntry.id).outerjoin(User, User.id == Booking.user_id).where(ReservedSlot.instrument_id == instrument_id)

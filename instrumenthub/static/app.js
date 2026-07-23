@@ -120,6 +120,19 @@ if (bar) {
   }, 15000);
 }
 
+/* All-instruments overview: refresh only when an instrument/block status changes. */
+const overview = document.querySelector("[data-calendar-overview][data-month]");
+if (overview) {
+  const overviewSlots = () => Array.from(overview.querySelectorAll("[data-overview-slot]"));
+  window.setInterval(async () => {
+    const response = await fetch(`/api/calendar?view=all&month=${encodeURIComponent(overview.dataset.month)}`);
+    if (!response.ok) return;
+    const payload = await response.json();
+    const current = new Map(overviewSlots().map((node) => [`${node.dataset.instrument}:${node.dataset.start}`, node.dataset.status]));
+    if (payload.slots.length !== current.size || payload.slots.some((slot) => current.get(`${slot.instrument_id}:${slot.start}`) !== slot.status)) window.location.reload();
+  }, 15000);
+}
+
 /* Booking wizard: live duration estimate and rule preview. */
 const wizard = document.querySelector("[data-booking-wizard]");
 if (wizard) {
