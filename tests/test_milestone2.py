@@ -146,6 +146,7 @@ def test_calendar_icon_assets_and_overview_selection_markup(client, configured):
     for name in ("selection-plus.svg", "info.svg", "sun-horizon.svg", "sun-dim.svg", "cloud-moon.svg"):
         response = client.get(f"/static/images/calendar/{name}")
         assert response.status_code == 200
+    assert client.get("/static/microscope.svg").status_code == 200
 
 
 def test_overview_orders_standard_blocks_and_uses_the_correct_time_icons(client, configured):
@@ -166,6 +167,14 @@ def test_individual_calendar_shows_time_icons_before_block_names(client, configu
     assert 'class="slot-time-icon afternoon"' in page.text
     assert 'class="slot-time-icon night"' in page.text
     assert page.text.index('class="slot-time-icon morning"') < page.text.index("Morning</strong>")
+
+
+def test_layout_reserves_scrollbar_space_and_aligns_header_to_calendar_view():
+    css = (__import__("pathlib").Path(__file__).parents[1] / "instrumenthub" / "static" / "app.css").read_text(encoding="utf-8")
+    template = (__import__("pathlib").Path(__file__).parents[1] / "instrumenthub" / "templates" / "base.html").read_text(encoding="utf-8")
+    assert "scrollbar-gutter: stable" in css
+    assert ".header-content" in css and "max-width: 1220px" in css
+    assert '<header><div class="header-content">' in template
 
 
 def test_block_and_maintenance_services_require_an_active_administrator(app, configured):
