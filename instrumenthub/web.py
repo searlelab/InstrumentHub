@@ -639,14 +639,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/calendar", response_class=HTMLResponse)
     def calendar_page(request: Request, instrument_id: int | None = None, month: str = "", view: str = "", message: str = ""):
-        _require_user(request)
+        user = _require_user(request)
         if view not in {"", "all"}:
             raise HTTPException(400, "Calendar view must be an instrument or all instruments.")
-        all_instruments = view == "all" or (view == "" and instrument_id is None)
         with database.session() as db:
             if not setup_complete(db):
                 return _redirect("/setup-required")
             instruments = db.scalars(select(Instrument).where(Instrument.active.is_(True)).order_by(Instrument.name)).all()
+            stored_user = db.get(User, user.id)
+            selected_instrument_id = None if view == "all" else instrument_id
+            if view == "" and instrument_id is None:
+                selected_instrument_id = stored_user.last_calendar_instrument_id
+            instrument = db.get(Instrument, selected_instrument_id) if selected_instrument_id else None
+            if selected_instrument_id and (not instrument or instrument not in instruments):
+                if instrument_id is not None and view != "all":
+                    raise HTTPException(404, "Instrument not found.")
+                selected_instrument_id = None
+                instrument = None
+            if stored_user.last_calendar_instrument_id != selected_instrument_id:
+                stored_user.last_calendar_instrument_id = selected_instrument_id
+            all_instruments = instrument is None
             year, month_number = selected_month(month)
             month_value = f"{year:04d}-{month_number:02d}"
             days = month_days(year, month_number)
@@ -664,9 +676,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         overview_by_day[day.isoformat()].append({"instrument": item, "accent_index": accent_index % 6, "slots": by_day.get(day.isoformat(), [])})
                 values = dict(common, overview_by_day=overview_by_day)
             else:
-                instrument = db.get(Instrument, instrument_id) if instrument_id else (instruments[0] if instruments else None)
-                if not instrument or instrument not in instruments:
-                    raise HTTPException(404, "Instrument not found.")
                 slots_by_day: dict[str, list[dict[str, object]]] = {}
                 for slot in calendar_data(db, instrument.id, year, month_number, timezone):
                     slots_by_day.setdefault(str(slot["date"]), []).append(slot)

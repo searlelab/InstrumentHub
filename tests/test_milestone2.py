@@ -24,9 +24,9 @@ def test_overnight_slots_preserve_nominal_duration_across_dst(app, configured):
     with app.state.database.session() as db:
         instrument = db.scalar(select(Instrument).order_by(Instrument.id))
         slots = slots_for_date(db, instrument.id, date(2026, 11, 1), "America/Chicago")
-        night = next(slot for slot in slots if slot.name == "Night")
-        assert night.nominal_minutes == 16 * 60
-        assert night.end.date() == night.start.date() + timedelta(days=1)
+        overnight = next(slot for slot in slots if slot.name == "Overnight")
+        assert overnight.nominal_minutes == 12 * 60
+        assert overnight.end.date() == overnight.start.date() + timedelta(days=1)
 
 
 def test_calendar_displays_initial_blocks_as_past_before_instrument_setup(app, configured):
@@ -55,8 +55,24 @@ def test_calendar_defaults_to_all_instruments_overview(client, configured):
     assert "Orbitrap A" in response.text
     assert "Orbitrap B" in response.text
     assert "Morning" in response.text
+    assert "Afternoon" in response.text
+    assert "Overnight" in response.text
     assert "data-calendar-overview" in response.text
     assert "data-selection-calendar" in response.text
+
+
+def test_calendar_remembers_the_last_selected_instrument(client, configured):
+    month = (date.today() + timedelta(days=3)).strftime("%Y-%m")
+    selected = client.get(f"/calendar?instrument_id=2&month={month}")
+    assert selected.status_code == 200
+    assert 'data-instrument="2"' in selected.text
+    remembered = client.get(f"/calendar?month={month}")
+    assert remembered.status_code == 200
+    assert 'data-instrument="2"' in remembered.text
+    all_instruments = client.get(f"/calendar?view=all&month={month}")
+    assert "data-calendar-overview" in all_instruments.text
+    default = client.get(f"/calendar?month={month}")
+    assert "data-calendar-overview" in default.text
 
 
 def test_maintenance_occupies_slots_and_conflicts(client, configured, app):
@@ -130,6 +146,26 @@ def test_calendar_icon_assets_and_overview_selection_markup(client, configured):
     for name in ("selection-plus.svg", "info.svg", "sun-horizon.svg", "sun-dim.svg", "cloud-moon.svg"):
         response = client.get(f"/static/images/calendar/{name}")
         assert response.status_code == 200
+
+
+def test_overview_orders_standard_blocks_and_uses_the_correct_time_icons(client, configured):
+    page = client.get(f"/calendar?view=all&month={(date.today() + timedelta(days=3)).strftime('%Y-%m')}")
+    assert page.status_code == 200
+    html = page.text
+    assert html.index('alt="Morning"') < html.index('alt="Afternoon"') < html.index('alt="Overnight"')
+    afternoon = html.index('alt="Afternoon"')
+    overnight = html.index('alt="Overnight"')
+    assert "sun-dim.svg" in html[max(0, afternoon - 180):afternoon]
+    assert "cloud-moon.svg" in html[max(0, overnight - 180):overnight]
+
+
+def test_individual_calendar_shows_time_icons_before_block_names(client, configured):
+    page = client.get(f"/calendar?instrument_id=1&month={(date.today() + timedelta(days=3)).strftime('%Y-%m')}")
+    assert page.status_code == 200
+    assert 'class="slot-time-icon morning"' in page.text
+    assert 'class="slot-time-icon afternoon"' in page.text
+    assert 'class="slot-time-icon night"' in page.text
+    assert page.text.index('class="slot-time-icon morning"') < page.text.index("Morning</strong>")
 
 
 def test_block_and_maintenance_services_require_an_active_administrator(app, configured):

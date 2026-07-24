@@ -20,6 +20,7 @@ class User(Base):
     email: Mapped[str] = mapped_column(String, default="")
     phone: Mapped[str] = mapped_column(String, default="")
     accent_color: Mapped[str] = mapped_column(String, default="#2563eb")
+    last_calendar_instrument_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     role: Mapped[str] = mapped_column(String, default="user")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     password_hash: Mapped[str] = mapped_column(String)

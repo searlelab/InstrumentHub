@@ -59,7 +59,7 @@ def configured(client, admin_csrf):
             "csrf_token": admin_csrf,
             "timezone": "America/Chicago",
             "instrument_name": "Orbitrap A",
-            "instrument_blocks": "Morning,08:00,16:00\nNight,16:00,08:00",
+            "instrument_blocks": "Morning,06:00,12:00\nAfternoon,12:00,18:00\nOvernight,18:00,06:00",
             "instrument_training": "yes",
             "hold_minutes": "15",
             "tentative_expiration_days": "",
@@ -72,7 +72,7 @@ def configured(client, admin_csrf):
         data={
             "csrf_token": admin_csrf,
             "name": "Orbitrap B",
-            "blocks": "Day,07:00,19:00\nNight,19:00,07:00",
+            "blocks": "Morning,06:00,12:00\nAfternoon,12:00,18:00\nOvernight,18:00,06:00",
         },
         follow_redirects=False,
     )

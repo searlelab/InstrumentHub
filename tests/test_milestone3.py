@@ -37,7 +37,7 @@ def future_slot(app, instrument_id=2, days=3):
         return slots_for_date(db, instrument_id, date.today() + timedelta(days=days), "America/Chicago")[0]
 
 
-def test_nonchronological_setup_blocks_are_stored_and_selected_in_clock_order(app, client):
+def test_three_block_setup_is_stored_and_selected_in_calendar_order(app, client):
     csrf = login(client)
     response = client.post(
         "/setup",
@@ -45,23 +45,27 @@ def test_nonchronological_setup_blocks_are_stored_and_selected_in_clock_order(ap
             "csrf_token": csrf,
             "timezone": "America/Chicago",
             "instrument_name": "Orbitrap A",
-            "instrument_blocks": "Morning,08:00,16:00\nEvening,16:00,00:00\nOvernight,00:00,08:00",
+            "instrument_blocks": "Morning,06:00,12:00\nAfternoon,12:00,18:00\nOvernight,18:00,06:00",
             "hold_minutes": "15",
             "tentative_expiration_days": "",
         },
         follow_redirects=False,
     )
     assert response.status_code == 303
-    assert [block[0] for block in parse_blocks("Morning,08:00,16:00\nEvening,16:00,00:00\nOvernight,00:00,08:00")] == ["Overnight", "Morning", "Evening"]
+    assert [block[0] for block in parse_blocks("Morning,06:00,12:00\nAfternoon,12:00,18:00\nOvernight,18:00,06:00")] == ["Morning", "Afternoon", "Overnight"]
     with app.state.database.session() as db:
         target = date.today() + timedelta(days=7)
         slots = slots_for_date(db, 1, target, "America/Chicago")
-        assert [slot.name for slot in slots] == ["Overnight", "Morning", "Evening"]
+        assert [slot.name for slot in slots] == ["Morning", "Afternoon", "Overnight"]
+        assert [slot.start.astimezone(ZoneInfo("America/Chicago")).hour for slot in slots] == [6, 12, 18]
+        assert [slot.nominal_minutes for slot in slots] == [360, 360, 720]
         admin = db.scalar(select(User).where(User.username == "admin"))
         hold, _token, selected = acquire_hold(db, user=admin, instrument_id=1, start_text=slots[0].start_text, count=3)
         assert hold.id
         assert all(slot.start > utcnow() for slot in selected)
         assert all(previous.end_text == current.start_text for previous, current in zip(selected, selected[1:]))
+        assert selected[0].start.astimezone(ZoneInfo("America/Chicago")).hour == 6
+        assert selected[-1].end.astimezone(ZoneInfo("America/Chicago")).hour == 6
 
 
 def test_setup_rejects_block_boundaries_in_a_spring_forward_gap(app, client):

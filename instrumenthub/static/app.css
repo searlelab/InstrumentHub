@@ -229,7 +229,8 @@ code { background: var(--mist); padding: .1rem .3rem; border-radius: .25rem; }
   border-left: .4rem solid var(--slate); background: #f7faf8; font-size: .8rem;
   border-top: 1px solid var(--line); border-right: 1px solid var(--line); border-bottom: 1px solid var(--line);
 }
-.slot strong { font-size: .82rem; }
+.slot strong { font-size: .82rem; display: inline-flex; align-items: center; gap: .3rem; }
+.slot-time-icon { width: 1rem; height: 1rem; opacity: .76; flex: none; }
 .slot-title { display: flex; align-items: center; justify-content: space-between; gap: .4rem; }
 .slot .details-toggle, .slot .drag-hint { display: inline-flex; align-items: center; line-height: 1; padding: .1rem; }
 .slot .details-toggle img, .slot .drag-hint img { width: .9rem; height: .9rem; }

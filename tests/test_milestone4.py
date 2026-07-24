@@ -603,16 +603,16 @@ def test_resume_preview_requires_a_reason_at_service_and_route_boundaries(app, c
 
 
 def test_resume_preserves_slots_that_precede_a_partially_affected_booking(app, configured):
-    _booking_id, entry_id, _ = make_booking(app, days=24, count=3)
+    _booking_id, entry_id, _ = make_booking(app, days=24, count=4)
     outage_date = date.today() + timedelta(days=25)
     with app.state.database.session() as db:
         admin = db.scalar(select(User).where(User.username == "admin"))
         before = db.scalars(select(ReservedSlot).where(ReservedSlot.calendar_entry_id == entry_id).order_by(ReservedSlot.slot_start)).all()
         preserved_start = before[1].slot_start
         outage = preview_outage(db, instrument_id=2, start_date=outage_date, end_date=None, reason="Fault", admin_id=admin.id)
-        assert [item["old_start"] for item in json.loads(outage.payload_json)["items"]] == [before[2].slot_start]
+        assert [item["old_start"] for item in json.loads(outage.payload_json)["items"]] == [before[3].slot_start]
         apply_schedule_draft(db, draft_id=outage.id, admin_id=admin.id)
-        assert [row.slot_start for row in db.scalars(select(ReservedSlot).where(ReservedSlot.calendar_entry_id == entry_id))] == [before[0].slot_start, preserved_start]
+        assert [row.slot_start for row in db.scalars(select(ReservedSlot).where(ReservedSlot.calendar_entry_id == entry_id))] == [before[0].slot_start, preserved_start, before[2].slot_start]
         resume = preview_resume(db, instrument_id=2, restart_date=outage_date + timedelta(days=4), admin_id=admin.id, reason="Repaired")
         resume_id = resume.id
     with app.state.database.session() as db:
@@ -620,7 +620,7 @@ def test_resume_preserves_slots_that_precede_a_partially_affected_booking(app, c
         apply_schedule_draft(db, draft_id=resume_id, admin_id=admin.id)
         starts = [row.slot_start for row in db.scalars(select(ReservedSlot).where(ReservedSlot.calendar_entry_id == entry_id).order_by(ReservedSlot.slot_start))]
         assert preserved_start in starts
-        assert len(starts) == 3
+        assert len(starts) == 4
 
 
 def test_schedule_apply_acquires_immediate_transaction_before_admin_lookup(app, configured, monkeypatch):
@@ -723,7 +723,8 @@ def test_resume_reconstructs_all_legacy_unresolved_outage_drafts(app, configured
         outage_a = slots_for_date(db, 2, date.today() + timedelta(days=5), "America/Chicago")[0]
         outage_b = slots_for_date(db, 2, date.today() + timedelta(days=6), "America/Chicago")[0]
         maintenance_slot = slots_for_date(db, 2, date.today() + timedelta(days=70), "America/Chicago")[0]
-        for index, (outage_slot, item) in enumerate(((outage_a, {"slot_id": 1001, "entry_id": booking_entry_id, "old_start": booking_start, "old_end": booking_start, "nominal_minutes": 720}), (outage_b, {"slot_id": 1002, "entry_id": maintenance_entry.id, "old_start": maintenance_slot.start_text, "old_end": maintenance_slot.end_text, "nominal_minutes": maintenance_slot.nominal_minutes})), start=1):
+        booking_slot = slots_for_date(db, 2, date.today() + timedelta(days=60), "America/Chicago")[0]
+        for index, (outage_slot, item) in enumerate(((outage_a, {"slot_id": 1001, "entry_id": booking_entry_id, "old_start": booking_start, "old_end": booking_start, "nominal_minutes": booking_slot.nominal_minutes}), (outage_b, {"slot_id": 1002, "entry_id": maintenance_entry.id, "old_start": maintenance_slot.start_text, "old_end": maintenance_slot.end_text, "nominal_minutes": maintenance_slot.nominal_minutes})), start=1):
             db.add(ScheduleChangeDraft(instrument_id=2, kind="unknown_outage", status="applied", reason=f"legacy {index}", payload_json=json.dumps({"outage_slots": [{"start": outage_slot.start_text, "end": outage_slot.end_text, "nominal_minutes": outage_slot.nominal_minutes}], "items": [item]}), created_by=admin.id, created_at=utc_text(), applied_at=utc_text()))
         db.get(Instrument, 2).unavailable = True
     with app.state.database.session() as db:
