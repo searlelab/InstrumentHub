@@ -417,6 +417,14 @@ def test_calendar_drag_hint_is_visible_for_keyboard_focus():
     assert ".drag-hint:focus-visible" in css
 
 
+def test_calendar_selection_is_shared_and_instrument_scoped():
+    js = (__import__("pathlib").Path(__file__).parents[1] / "instrumenthub" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "[data-selection-calendar]" in js
+    assert "from.dataset.instrument !== to.dataset.instrument" in js
+    assert "instrumentField.value = run[0].dataset.instrument" in js
+    assert "span.some((node) => node.dataset.status !== \"available\")" in js
+
+
 def test_known_outage_preview_is_nonmutating_then_shifts(app, configured):
     booking_id, entry_id, original_start = make_booking(app, days=14)
     admin = admin_user(app); outage_date = date.today() + timedelta(days=14)

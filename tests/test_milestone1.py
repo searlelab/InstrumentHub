@@ -196,7 +196,8 @@ def test_admin_can_add_instrument_and_calendar_overview_uses_active_instruments(
     assert "All instruments" in overview.text
     assert "Orbitrap C" in overview.text
     assert "data-calendar-overview" in overview.text
-    assert "Hold selected blocks" not in overview.text
+    assert "Hold selected blocks" in overview.text
+    assert "data-select-instrument" in overview.text
     assert 'data-accent="all"' in overview.text
     assert 'data-accent="0"' in overview.text
     assert 'data-accent="1"' in overview.text

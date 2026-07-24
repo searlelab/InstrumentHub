@@ -59,7 +59,7 @@ def test_usage_report_handles_empty_filters_and_calendar_shows_no_current_user(c
     assert rows == [] and totals == {} and usage == [] and allotments == []
     page = client.get("/calendar")
     assert page.status_code == 200
-    assert "No active user is scheduled" in page.text
+    assert "Hover a block for its instrument" in page.text
 
 
 def test_canceled_usage_and_csv_link_keep_the_selected_grant(client, configured, app):

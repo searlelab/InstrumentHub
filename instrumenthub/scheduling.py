@@ -87,6 +87,38 @@ def slots_for_range(db: Session, instrument_id: int, start_date: date, end_date:
     return output
 
 
+def calendar_slots_for_date(db: Session, instrument_id: int, local_date: date, timezone: str) -> list[Slot]:
+    """Return schedulable blocks, or the initial block pattern for historic display only."""
+    slots = slots_for_date(db, instrument_id, local_date, timezone)
+    if slots:
+        return slots
+    first_effective = db.scalar(
+        select(BlockDefinition.effective_from)
+        .where(BlockDefinition.instrument_id == instrument_id)
+        .order_by(BlockDefinition.effective_from)
+        .limit(1)
+    )
+    if not first_effective or local_date >= date.fromisoformat(first_effective):
+        return []
+    definitions = db.scalars(
+        select(BlockDefinition)
+        .where(BlockDefinition.instrument_id == instrument_id, BlockDefinition.effective_from == first_effective)
+        .order_by(BlockDefinition.sort_order)
+    ).all()
+    return slots_from_blocks([(item.name, item.start_time, item.end_time) for item in definitions], local_date, timezone)
+
+
+def calendar_slots_for_range(db: Session, instrument_id: int, start_date: date, end_date: date, timezone: str) -> list[Slot]:
+    if end_date < start_date or (end_date - start_date).days > 400:
+        raise ValueError("Invalid scheduling date range.")
+    output: list[Slot] = []
+    current = start_date
+    while current <= end_date:
+        output.extend(calendar_slots_for_date(db, instrument_id, current, timezone))
+        current += timedelta(days=1)
+    return output
+
+
 def month_days(year: int, month: int) -> list[date]:
     return list(calendar_module.Calendar(firstweekday=0).itermonthdates(year, month))
 
@@ -164,7 +196,7 @@ def calendar_data(db: Session, instrument_id: int, year: int, month: int, timezo
         prune_expired_holds(db)
         prune_expired_tentatives(db)
     days = month_days(year, month)
-    slots = slots_for_range(db, instrument_id, days[0], days[-1], timezone)
+    slots = calendar_slots_for_range(db, instrument_id, days[0], days[-1], timezone)
     query = select(ReservedSlot, CalendarEntry, Booking, User).join(CalendarEntry, CalendarEntry.id == ReservedSlot.calendar_entry_id).outerjoin(Booking, Booking.calendar_entry_id == CalendarEntry.id).outerjoin(User, User.id == Booking.user_id).where(ReservedSlot.instrument_id == instrument_id)
     if slots:
         query = query.where(ReservedSlot.slot_start >= slots[0].start_text, ReservedSlot.slot_start <= slots[-1].start_text)
@@ -178,7 +210,7 @@ def calendar_data(db: Session, instrument_id: int, year: int, month: int, timezo
             item.update(status="past", title="Past")
         if occupied:
             _reserved, entry, _booking, handler = occupied
-            item.update(status="held" if entry.entry_type == "hold" else entry.state, title=entry.title, entry_id=entry.id, entry_type=entry.entry_type, handler_initials=handler.initials if handler else "")
+            item.update(status="held" if entry.entry_type == "hold" else entry.state, title=entry.title, entry_id=entry.id, entry_type=entry.entry_type, handler_initials=handler.initials if handler else "", handler_name=handler.display_name if handler else "")
         output.append(item)
     return output
 

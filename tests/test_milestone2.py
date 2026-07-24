@@ -9,7 +9,7 @@ from instrumenthub.models import Instrument, User
 from instrumenthub.security import utc_text, utcnow
 from tests.test_milestone4 import make_booking
 from instrumenthub.services import replace_block_definitions
-from instrumenthub.scheduling import create_maintenance, month_days, slots_for_date
+from instrumenthub.scheduling import calendar_data, create_maintenance, month_days, slots_for_date
 from tests.conftest import login
 
 
@@ -29,6 +29,15 @@ def test_overnight_slots_preserve_nominal_duration_across_dst(app, configured):
         assert night.end.date() == night.start.date() + timedelta(days=1)
 
 
+def test_calendar_displays_initial_blocks_as_past_before_instrument_setup(app, configured):
+    previous_month = (date.today().replace(day=1) - timedelta(days=1))
+    with app.state.database.session() as db:
+        instrument = db.scalar(select(Instrument).order_by(Instrument.id))
+        slots = calendar_data(db, instrument.id, previous_month.year, previous_month.month, "America/Chicago")
+    assert slots
+    assert all(slot["status"] == "past" for slot in slots)
+
+
 def test_calendar_requires_authentication(client, configured):
     client.post("/logout", data={"csrf_token": configured})
     response = client.get("/api/calendar?instrument_id=1&month=2026-08", follow_redirects=False)
@@ -40,13 +49,14 @@ def test_calendar_api_requires_an_individual_instrument(client, configured):
     assert response.status_code == 400
 
 
-def test_calendar_renders_both_instruments_and_local_blocks(client, configured):
+def test_calendar_defaults_to_all_instruments_overview(client, configured):
     response = client.get("/calendar?month=2026-08")
     assert response.status_code == 200
     assert "Orbitrap A" in response.text
     assert "Orbitrap B" in response.text
     assert "Morning" in response.text
-    assert "America/Chicago" in response.text
+    assert "data-calendar-overview" in response.text
+    assert "data-selection-calendar" in response.text
 
 
 def test_maintenance_occupies_slots_and_conflicts(client, configured, app):
@@ -100,10 +110,26 @@ def test_overview_links_confirmed_entries_but_not_holds(client, app, configured)
     page = client.get(f"/calendar?view=all&month={start[:7]}")
     assert f'href="/entries/{entry_id}"' in page.text
     assert "overview-slot confirmed" in page.text
-    assert "OPS-14" in page.text
-    assert "LM</span>" in page.text
+    assert 'title="Orbitrap B —' in page.text
+    assert "OPS-14 (Confirmed), Lab Member" in page.text
+    assert "LM</span>" not in page.text
     assert f'href="/entries/{hold_entry_id}"' not in page.text
     assert "overview-slot held" in page.text
+
+
+def test_calendar_icon_assets_and_overview_selection_markup(client, configured):
+    page = client.get("/calendar?view=all&month=2026-08")
+    assert page.status_code == 200
+    assert "data-selection-calendar" in page.text
+    assert "data-select-instrument" in page.text
+    template = (__import__("pathlib").Path(__file__).parents[1] / "instrumenthub" / "templates" / "calendar.html").read_text(encoding="utf-8")
+    assert "sun-horizon.svg" in template
+    assert "sun-dim.svg" in template
+    assert "cloud-moon.svg" in template
+    assert "selection-plus.svg" in page.text
+    for name in ("selection-plus.svg", "info.svg", "sun-horizon.svg", "sun-dim.svg", "cloud-moon.svg"):
+        response = client.get(f"/static/images/calendar/{name}")
+        assert response.status_code == 200
 
 
 def test_block_and_maintenance_services_require_an_active_administrator(app, configured):

@@ -19,16 +19,14 @@ if (hold) {
   window.setInterval(tick, 1000);
 }
 
-/* Calendar: drag-to-select consecutive open blocks, plus live availability refresh */
-const calendar = document.querySelector(".calendar[data-instrument][data-month]");
-if (calendar) {
-  const bar = document.getElementById("select-bar");
+/* Calendar: instrument-scoped drag selection, shared by individual and overview views. */
+document.querySelectorAll("[data-selection-calendar]").forEach((calendar) => {
+  const bar = calendar.parentElement.querySelector("[data-select-bar]");
   const summary = bar && bar.querySelector("[data-select-summary]");
+  const instrumentField = bar && bar.querySelector("[data-select-instrument]");
   const startField = bar && bar.querySelector("[data-select-start]");
   const countField = bar && bar.querySelector("[data-select-count]");
-  const slots = () => Array.from(calendar.querySelectorAll(".slot[data-start]"));
-  const openSlots = () => slots().filter((node) => node.dataset.status === "available");
-
+  const slots = () => Array.from(calendar.querySelectorAll("[data-start]"));
   let anchor = null;
   let dragging = false;
 
@@ -38,18 +36,15 @@ if (calendar) {
     anchor = null;
   };
 
-  // Contiguous run of open blocks between anchor and focus; empty if any gap is not open.
+  // A run may only stay on the instrument where the selection began.
   const runBetween = (from, to) => {
-    const open = openSlots();
-    let a = open.indexOf(from);
-    let b = open.indexOf(to);
+    if (!from || !to || from.dataset.instrument !== to.dataset.instrument) return [];
+    const instrumentSlots = slots().filter((node) => node.dataset.instrument === from.dataset.instrument);
+    let a = instrumentSlots.indexOf(from);
+    let b = instrumentSlots.indexOf(to);
     if (a < 0 || b < 0) return [];
     if (a > b) [a, b] = [b, a];
-    // Require the selected blocks to be adjacent in the full block sequence (no booked gap).
-    const all = slots();
-    const startIdx = all.indexOf(open[a]);
-    const endIdx = all.indexOf(open[b]);
-    const span = all.slice(startIdx, endIdx + 1);
+    const span = instrumentSlots.slice(a, b + 1);
     if (span.some((node) => node.dataset.status !== "available")) return [];
     if (span.some((node, index) => index > 0 && span[index - 1].dataset.end > node.dataset.start)) return [];
     return span;
@@ -60,6 +55,7 @@ if (calendar) {
     slots().forEach((node) => node.classList.remove("selected"));
     if (!run.length || !bar) return;
     run.forEach((node) => node.classList.add("selected"));
+    instrumentField.value = run[0].dataset.instrument;
     startField.value = run[0].dataset.start;
     countField.value = run.length;
     summary.textContent = `${run.length} open block${run.length > 1 ? "s" : ""} selected`;
@@ -67,9 +63,9 @@ if (calendar) {
   };
 
   calendar.addEventListener("pointerdown", (event) => {
-    const slot = event.target.closest(".slot");
+    const slot = event.target.closest("[data-select-slot]");
     if (!slot || slot.dataset.status !== "available") return;
-    if (event.target.closest("a")) return; // allow the keyboard/click fallback link
+    if (event.target.closest("a")) return; // retain the individual calendar's keyboard fallback link
     event.preventDefault();
     dragging = true;
     calendar.classList.add("dragging");
@@ -79,7 +75,7 @@ if (calendar) {
 
   calendar.addEventListener("pointerover", (event) => {
     if (!dragging) return;
-    const slot = event.target.closest(".slot");
+    const slot = event.target.closest("[data-start]");
     if (slot) paint(slot);
   });
 
@@ -90,20 +86,23 @@ if (calendar) {
   window.addEventListener("pointerup", endDrag);
   window.addEventListener("pointercancel", endDrag);
 
-  // Single click (no drag) selects one block.
   calendar.addEventListener("click", (event) => {
-    const link = event.target.closest("a");
-    if (link) return;
-    const slot = event.target.closest(".slot");
+    if (event.target.closest("a")) return;
+    const slot = event.target.closest("[data-select-slot]");
     if (slot && slot.dataset.status === "available" && !slot.classList.contains("selected")) {
       anchor = slot;
       paint(slot);
     }
   });
 
-if (bar) {
-    bar.querySelector("[data-select-clear]").addEventListener("click", clearSelection);
-  }
+  if (bar) bar.querySelector("[data-select-clear]").addEventListener("click", clearSelection);
+});
+
+/* Individual calendar: refresh availability unless a selection is in progress. */
+const calendar = document.querySelector(".calendar[data-instrument][data-month]");
+if (calendar) {
+  const bar = calendar.parentElement.querySelector("[data-select-bar]");
+  const slots = () => Array.from(calendar.querySelectorAll(".slot[data-start]"));
 
   /* Live availability refresh — skip while a selection is in progress. */
   window.setInterval(async () => {

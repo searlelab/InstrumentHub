@@ -642,6 +642,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _require_user(request)
         if view not in {"", "all"}:
             raise HTTPException(400, "Calendar view must be an instrument or all instruments.")
+        all_instruments = view == "all" or (view == "" and instrument_id is None)
         with database.session() as db:
             if not setup_complete(db):
                 return _redirect("/setup-required")
@@ -650,17 +651,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             month_value = f"{year:04d}-{month_number:02d}"
             days = month_days(year, month_number)
             timezone = get_setting(db, "timezone", "UTC") or "UTC"
-            common = dict(instruments=instruments, all_instruments=view == "all", month=month_value, month_label=datetime(year, month_number, 1).strftime("%B %Y"), selected_month=month_number, days=days, timezone=timezone, previous_month=adjacent_month(year, month_number, -1), next_month=adjacent_month(year, month_number, 1))
-            if view == "all":
+            common = dict(instruments=instruments, all_instruments=all_instruments, month=month_value, month_label=datetime(year, month_number, 1).strftime("%B %Y"), selected_month=month_number, days=days, timezone=timezone, previous_month=adjacent_month(year, month_number, -1), next_month=adjacent_month(year, month_number, 1))
+            if all_instruments:
                 prune_expired_holds(db)
                 prune_expired_tentatives(db)
                 overview_by_day: dict[str, list[dict[str, object]]] = {day.isoformat(): [] for day in days}
-                for item in instruments:
+                for accent_index, item in enumerate(instruments):
                     by_day: dict[str, list[dict[str, object]]] = {}
                     for slot in calendar_data(db, item.id, year, month_number, timezone, prune=False):
                         by_day.setdefault(str(slot["date"]), []).append(slot)
                     for day in days:
-                        overview_by_day[day.isoformat()].append({"instrument": item, "slots": by_day.get(day.isoformat(), [])})
+                        overview_by_day[day.isoformat()].append({"instrument": item, "accent_index": accent_index % 6, "slots": by_day.get(day.isoformat(), [])})
                 values = dict(common, overview_by_day=overview_by_day)
             else:
                 instrument = db.get(Instrument, instrument_id) if instrument_id else (instruments[0] if instruments else None)
