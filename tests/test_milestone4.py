@@ -303,8 +303,9 @@ def test_admin_can_correct_terminal_booking_metadata_without_schedule_controls(a
     assert page.status_code == 200
     assert 'name="new_start"' not in page.text
     assert 'name="block_count"' not in page.text
+    assert 'name="expected_minutes" min="1" placeholder="300 minutes currently recorded"' in page.text
     response = client.post(f"/bookings/{booking_id}/edit", data={
-        "csrf_token": configured, "experiment_code": f"CORRECTED-{terminal_state}", "expected_minutes": "300",
+        "csrf_token": configured, "experiment_code": f"CORRECTED-{terminal_state}", "expected_minutes": "240",
         "sample_category": "test", "description": "Corrected metadata", "admin_notes": "Historical correction",
         "reason": "Correct terminal metadata",
     }, follow_redirects=False)
@@ -312,6 +313,7 @@ def test_admin_can_correct_terminal_booking_metadata_without_schedule_controls(a
     with app.state.database.session() as db:
         booking = db.get(Booking, booking_id)
         assert booking.experiment_code == f"CORRECTED-{terminal_state}"
+        assert booking.expected_minutes == 240
         assert db.get(CalendarEntry, entry_id).state == terminal_state
         assert not db.scalars(select(ReservedSlot).where(ReservedSlot.calendar_entry_id == entry_id)).all()
         event = db.scalar(select(AuditEvent).where(AuditEvent.action == "updated", AuditEvent.entity_type == "booking", AuditEvent.entity_id == str(booking_id)).order_by(AuditEvent.id.desc()))

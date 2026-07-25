@@ -12,6 +12,7 @@ from sqlalchemy import event, func, select
 
 import instrumenthub.booking as booking_module
 from instrumenthub.booking import acquire_hold, configured_slots, release_hold, release_hold_as_admin, submit_booking
+from instrumenthub.management import decide_booking
 from instrumenthub.models import Allotment, AppSetting, AuditEvent, Booking, CalendarEntry, Grant, Hold, Instrument, InstrumentTraining, PI, Project, ProjectGrant, ReservedSlot, SessionRecord, User, UserProject
 from instrumenthub.rules import allotment_balances, estimate_duration_minutes, evaluate_booking, overall_result
 from instrumenthub.scheduling import calendar_data, prune_expired_holds, slots_for_date
@@ -187,15 +188,17 @@ def test_hold_to_confirmed_booking_and_contact_detail(client, configured, app):
     with app.state.database.session() as db:
         session = db.scalar(select(SessionRecord).where(SessionRecord.user_id == 2, SessionRecord.revoked_at.is_(None)))
         session.wizard_json = json.dumps({"experiment_code": "stale experiment"})
-    result = client.post("/book/submit", data={"csrf_token": csrf, "hold_id": hold_id, "instrument_id": "2", "pi_id": pi_id, "project_id": project_id, "experiment_code": "EXP-1", "expected_minutes": "300", "sample_category": "cells"}, follow_redirects=False)
+    result = client.post("/book/submit", data={"csrf_token": csrf, "hold_id": hold_id, "instrument_id": "2", "pi_id": pi_id, "project_id": project_id, "experiment_code": "EXP-1", "sample_category": "cells"}, follow_redirects=False)
     assert result.status_code == 303
     detail = client.get(result.headers["location"])
     assert "EXP-1" in detail.text
     assert "member@example.test" in detail.text
-    assert "Reserved blocks" in detail.text
+    assert "Reserved duration" in detail.text
     with app.state.database.session() as db:
         entry = db.scalar(select(CalendarEntry).where(CalendarEntry.title == "EXP-1"))
         assert entry.state == "confirmed"
+        booking = db.scalar(select(Booking).where(Booking.calendar_entry_id == entry.id))
+        assert booking.expected_minutes == booking.reserved_minutes == 360
         session = db.scalar(select(SessionRecord).where(SessionRecord.user_id == 2, SessionRecord.revoked_at.is_(None)))
         assert json.loads(session.wizard_json) == {}
 
@@ -467,7 +470,7 @@ def test_hold_error_uses_configured_duration(client, configured, app):
     assert "held for 7 minutes" in response.text
 
 
-def test_booking_wizard_has_live_duration_rules_and_allotment_balances(client, configured, app):
+def test_booking_wizard_has_live_rules_reference_filters_and_allotment_balances(client, configured, app):
     pi_id, project_id = seed_booking_references(app)
     slot = future_slot(app, days=25)
     with app.state.database.session() as db:
@@ -478,12 +481,79 @@ def test_booking_wizard_has_live_duration_rules_and_allotment_balances(client, c
     hold_id = int(held.headers["location"].split("/")[-1])
     form = client.get(held.headers["location"])
     assert "data-booking-wizard" in form.text
-    assert "data-duration-estimate" in form.text
     assert "data-rule-preview" in form.text
+    assert 'data-pi-id="' in form.text
+    assert 'name="expected_minutes"' not in form.text
+    assert 'name="injection_count"' not in form.text
+    assert "Your selected blocks define the booking duration" in form.text
+    assert "reduce contamination or carryover" in form.text
+    script = client.get("/static/app.js").text
+    assert 'wizard.addEventListener("invalid"' in script
+    assert 'optionalDetails.addEventListener("toggle"' in script
     assert client.get("/api/duration-estimate?injection_count=8&gradient_minutes=60").json()["minutes"] == 520
     preview = client.post("/api/rules/preview", json={"hold_id": hold_id, "pi_id": pi_id, "project_id": project_id}, headers={"X-CSRF-Token": csrf})
     assert preview.status_code == 200
     assert preview.json()["allotment_balances"][0]["remaining_minutes"] == 1000
+
+
+def test_member_can_quick_create_audited_booking_references(client, configured, app):
+    client.post("/logout", data={"csrf_token": configured})
+    csrf = login(client, "member", "correct-horse-member!")
+    headers = {"X-CSRF-Token": csrf}
+    pi_response = client.post("/api/booking-references/pi", json={"name": "Dr. Quick", "email": "quick@example.test"}, headers=headers)
+    assert pi_response.status_code == 201
+    pi_id = pi_response.json()["id"]
+    project_response = client.post("/api/booking-references/project", json={"pi_id": pi_id, "code": "QUICK-1", "name": "Quick project"}, headers=headers)
+    assert project_response.status_code == 201
+    project_id = project_response.json()["id"]
+    grant_response = client.post("/api/booking-references/grant", json={"project_id": project_id, "number": "R01-QUICK", "name": "Quick grant"}, headers=headers)
+    assert grant_response.status_code == 201
+    grant_id = grant_response.json()["id"]
+    with app.state.database.session() as db:
+        assert db.get(UserProject, {"user_id": 2, "project_id": project_id})
+        assert db.get(ProjectGrant, {"project_id": project_id, "grant_id": grant_id})
+        events = db.scalars(select(AuditEvent).where(AuditEvent.actor_user_id == 2, AuditEvent.action == "created").order_by(AuditEvent.id)).all()
+        assert [event.entity_type for event in events[-3:]] == ["pi", "project", "grant"]
+    slot = future_slot(app, days=38)
+    held = client.post("/book/hold", data={"csrf_token": csrf, "instrument_id": "2", "slot_start": slot.start_text, "count": "1"}, follow_redirects=False)
+    hold_id = int(held.headers["location"].split("/")[-1])
+    preview = client.post("/api/rules/preview", json={"hold_id": hold_id, "pi_id": pi_id, "project_id": project_id}, headers=headers)
+    assert "booking_reference_review" in [result["code"] for result in preview.json()["results"]]
+    submitted = client.post("/book/submit", data={"csrf_token": csrf, "hold_id": hold_id, "instrument_id": "2", "pi_id": pi_id, "project_id": project_id, "grant_id": grant_id, "experiment_code": "QUICK-REVIEW", "sample_category": "cells"}, follow_redirects=False)
+    assert submitted.status_code == 303
+    with app.state.database.session() as db:
+        entry = db.scalar(select(CalendarEntry).where(CalendarEntry.title == "QUICK-REVIEW"))
+        booking = db.scalar(select(Booking).where(Booking.calendar_entry_id == entry.id))
+        assert entry.state == "tentative"
+        decide_booking(db, booking_id=booking.id, decision="approved", admin_id=1, reason="Reference data verified")
+        validated = db.scalars(select(AuditEvent).where(AuditEvent.action == "validated").order_by(AuditEvent.id)).all()
+        assert [(event.entity_type, event.entity_id) for event in validated[-2:]] == [("pi", str(pi_id)), ("project", str(project_id))]
+    next_slot = future_slot(app, days=40)
+    next_hold = client.post("/book/hold", data={"csrf_token": csrf, "instrument_id": "2", "slot_start": next_slot.start_text, "count": "1"}, follow_redirects=False)
+    next_hold_id = int(next_hold.headers["location"].split("/")[-1])
+    confirmed = client.post("/book/submit", data={"csrf_token": csrf, "hold_id": next_hold_id, "instrument_id": "2", "pi_id": pi_id, "project_id": project_id, "experiment_code": "QUICK-VALIDATED", "sample_category": "cells"}, follow_redirects=False)
+    assert confirmed.status_code == 303
+    with app.state.database.session() as db:
+        assert db.scalar(select(CalendarEntry).where(CalendarEntry.title == "QUICK-VALIDATED")).state == "confirmed"
+
+
+def test_quick_create_rejects_duplicates_and_review_request_needs_context(client, configured, app):
+    pi_id, project_id = seed_booking_references(app)
+    slot = future_slot(app, days=39)
+    client.post("/logout", data={"csrf_token": configured})
+    csrf = login(client, "member", "correct-horse-member!")
+    duplicate = client.post("/api/booking-references/pi", json={"name": "dr. example"}, headers={"X-CSRF-Token": csrf})
+    assert duplicate.status_code == 400
+    held = client.post("/book/hold", data={"csrf_token": csrf, "instrument_id": "2", "slot_start": slot.start_text, "count": "1"}, follow_redirects=False)
+    hold_id = int(held.headers["location"].split("/")[-1])
+    result = client.post("/book/submit", data={"csrf_token": csrf, "hold_id": hold_id, "instrument_id": "2", "pi_id": pi_id, "project_id": project_id, "experiment_code": "REVIEW", "sample_category": "single-cell", "override_required": "yes"}, follow_redirects=False)
+    assert result.status_code == 303
+    assert "Tell+the+scheduler+why+administrator+review+is+needed" in result.headers["location"]
+    submitted = client.post("/book/submit", data={"csrf_token": csrf, "hold_id": hold_id, "instrument_id": "2", "pi_id": pi_id, "project_id": project_id, "experiment_code": "REVIEW", "sample_category": "single-cell", "override_required": "yes", "admin_notes": "Additional time is needed for a critical cohort."}, follow_redirects=False)
+    assert submitted.status_code == 303
+    with app.state.database.session() as db:
+        entry = db.scalar(select(CalendarEntry).where(CalendarEntry.title == "REVIEW"))
+        assert entry.state == "tentative"
 
 
 def test_lost_hold_returns_to_calendar_and_retains_wizard_fields(client, configured, app):

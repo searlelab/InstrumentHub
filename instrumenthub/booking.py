@@ -4,7 +4,8 @@ import json
 import secrets
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .models import Booking, CalendarEntry, Grant, Hold, Instrument, PI, Project, ProjectGrant, ReservedSlot, SessionRecord, User, UserProject
@@ -13,6 +14,77 @@ from .scheduling import Slot, prune_expired_holds, prune_expired_tentatives, res
 from .security import hash_token, parse_utc, utc_text, utcnow
 from .services import audit, get_setting, require_active_admin
 from .notifications import enqueue_notification
+
+
+def create_booking_pi(db: Session, *, user: User, name: str, email: str = "", request_id: str = "") -> PI:
+    user = db.get(User, user.id)
+    normalized_name = name.strip()
+    if not user or not user.active:
+        raise ValueError("An active user is required.")
+    if not normalized_name:
+        raise ValueError("PI name is required.")
+    if db.scalar(select(PI.id).where(func.lower(PI.name) == normalized_name.lower())):
+        raise ValueError("A PI with that name already exists. Select the existing PI instead.")
+    pi = PI(name=normalized_name, email=email.strip(), active=True)
+    db.add(pi)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        raise ValueError("A PI with that name already exists. Select the existing PI instead.") from exc
+    audit(db, "created", "pi", pi.id, actor_user_id=user.id, after={"name": pi.name, "source": "booking", "requires_review": user.role != "admin"}, request_id=request_id)
+    return pi
+
+
+def create_booking_project(
+    db: Session, *, user: User, pi_id: int, code: str, name: str, request_id: str = "",
+) -> Project:
+    user = db.get(User, user.id)
+    pi = db.get(PI, pi_id)
+    normalized_code, normalized_name = code.strip(), name.strip()
+    if not user or not user.active:
+        raise ValueError("An active user is required.")
+    if not pi or not pi.active:
+        raise ValueError("Select an active PI before creating a project.")
+    if not normalized_code or not normalized_name:
+        raise ValueError("Project code and name are required.")
+    if db.scalar(select(Project.id).where(func.lower(Project.code) == normalized_code.lower())):
+        raise ValueError("A project with that code already exists. Select the existing project instead.")
+    project = Project(pi_id=pi.id, code=normalized_code, name=normalized_name, max_consecutive_minutes=None, active=True)
+    db.add(project)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        raise ValueError("A project with that code already exists. Select the existing project instead.") from exc
+    db.add(UserProject(user_id=user.id, project_id=project.id))
+    audit(db, "created", "project", project.id, actor_user_id=user.id, after={"code": project.code, "pi_id": pi.id, "source": "booking", "requires_review": user.role != "admin"}, request_id=request_id)
+    return project
+
+
+def create_booking_grant(
+    db: Session, *, user: User, project_id: int, number: str, name: str, request_id: str = "",
+) -> Grant:
+    user = db.get(User, user.id)
+    project = db.get(Project, project_id)
+    normalized_number, normalized_name = number.strip(), name.strip()
+    if not user or not user.active:
+        raise ValueError("An active user is required.")
+    if not project or not project.active:
+        raise ValueError("Select an active project before creating a grant.")
+    if user.role != "admin" and not db.get(UserProject, {"user_id": user.id, "project_id": project.id}):
+        raise ValueError("Add the selected project to your profile before creating a grant for it.")
+    if not normalized_number or not normalized_name:
+        raise ValueError("Grant number and name are required.")
+    if db.scalar(select(Grant.id).where(func.lower(Grant.number) == normalized_number.lower())):
+        raise ValueError("A grant with that number already exists. Select the existing grant instead.")
+    grant = Grant(pi_id=project.pi_id, number=normalized_number, name=normalized_name, active=True)
+    db.add(grant)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        raise ValueError("A grant with that number already exists. Select the existing grant instead.") from exc
+    db.add(ProjectGrant(project_id=project.id, grant_id=grant.id))
+    audit(db, "created", "grant", grant.id, actor_user_id=user.id, after={"number": grant.number, "project_id": project.id, "source": "booking"}, request_id=request_id)
+    return grant
 
 
 def configured_slots(db: Session, instrument_id: int, start_text: str, count: int) -> list[Slot]:
@@ -130,11 +202,9 @@ def submit_booking(
         if not grant or not link:
             raise ValueError("The selected grant is not linked to the project.")
     if expected_minutes is None:
-        if injection_count is None or gradient_minutes is None:
-            raise ValueError("Provide expected minutes or injection count and gradient length.")
-        expected_minutes = estimate_duration_minutes(injection_count, gradient_minutes)
+        expected_minutes = estimate_duration_minutes(injection_count, gradient_minutes) if injection_count is not None and gradient_minutes is not None else sum(row.nominal_minutes for row in rows)
     if expected_minutes <= 0 or not experiment_code.strip() or not sample_category.strip():
-        raise ValueError("Experiment code, expected duration, and sample category are required.")
+        raise ValueError("Experiment code and sample category are required; any supplied duration must be positive.")
     slots = slot_values(rows)
     try:
         current_slots = configured_slots(db, entry.instrument_id, rows[0].slot_start, len(rows))

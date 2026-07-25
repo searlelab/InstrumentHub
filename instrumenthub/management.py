@@ -12,7 +12,7 @@ from .models import (
     ApprovalDecision, Booking, CalendarEntry, Instrument, Maintenance, PI, Project,
     ReservedSlot, ScheduleChangeDraft, User,
 )
-from .rules import evaluate_booking, overall_result
+from .rules import booking_reference_requires_review, evaluate_booking, overall_result
 from .scheduling import Slot, prune_expired_holds, reservation_overlap, reserve_slots, slots_for_range
 from .security import parse_utc, utc_text
 from .services import audit, get_setting, require_active_admin
@@ -94,6 +94,9 @@ def decide_booking(db: Session, *, booking_id: int, decision: str, admin_id: int
         if overall_result(results) == "blocked":
             raise ValueError("The booking is now blocked and cannot be approved.")
         entry.state = "confirmed"
+        for entity_type, entity_id in (("pi", booking.pi_id), ("project", booking.project_id)):
+            if booking_reference_requires_review(db, entity_type, entity_id):
+                audit(db, "validated", entity_type, entity_id, actor_user_id=admin_id, reason=reason, after={"booking_id": booking.id}, request_id=request_id)
     else:
         entry.state = "rejected"
         booking.reserved_minutes = sum(row.nominal_minutes for row in rows)
@@ -132,7 +135,7 @@ def cancel_booking(db: Session, *, booking_id: int, actor: User, reason: str = "
 
 
 def edit_booking(
-    db: Session, *, booking_id: int, actor: User, experiment_code: str, expected_minutes: int,
+    db: Session, *, booking_id: int, actor: User, experiment_code: str, expected_minutes: int | None,
     sample_category: str, description: str, admin_notes: str, column_setup: str | object = _UNSET,
     libraries_present: bool | object = _UNSET, gradient_minutes: int | None | object = _UNSET, new_start: str | None = None,
     block_count: int | None = None, reason: str = "", request_id: str = "",
@@ -149,8 +152,11 @@ def edit_booking(
         raise ValueError("This booking is not eligible for owner editing.")
     if not owner_edit and not reason.strip():
         raise ValueError("An administrator reason is required.")
+    duration_omitted = expected_minutes is None
+    if expected_minutes is None:
+        expected_minutes = booking.expected_minutes
     if not experiment_code.strip() or expected_minutes <= 0 or not sample_category.strip() or (gradient_minutes is not _UNSET and gradient_minutes is not None and gradient_minutes <= 0):
-        raise ValueError("Experiment code, expected duration, and sample category are required.")
+        raise ValueError("Experiment code and sample category are required.")
     if new_start and entry.state not in {"tentative", "confirmed"}:
         article = "An" if entry.state == "active" else "A"
         raise ValueError(
@@ -184,6 +190,8 @@ def edit_booking(
         if not owner_edit:
             booking.administratively_altered = True
         updated_rows = slots
+        if duration_omitted:
+            expected_minutes = sum(slot.nominal_minutes for slot in slots)
     booking.experiment_code, booking.expected_minutes = experiment_code.strip(), expected_minutes
     booking.sample_category, booking.description = sample_category.strip(), description.strip()
     if column_setup is not _UNSET:

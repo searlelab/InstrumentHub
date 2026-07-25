@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import asdict, dataclass
 from typing import Literal
@@ -8,7 +9,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import Allotment, Booking, CalendarEntry, Instrument, InstrumentTraining, PI, Project, ReservedSlot, User
+from .models import Allotment, AuditEvent, Booking, CalendarEntry, Instrument, InstrumentTraining, PI, Project, ReservedSlot, User
 from .scheduling import Slot, reservation_overlap
 from .security import parse_utc
 from .services import get_setting
@@ -24,6 +25,20 @@ class RuleResult:
 
     def as_dict(self) -> dict[str, str]:
         return asdict(self)
+
+
+def booking_reference_requires_review(db: Session, entity_type: str, entity_id: int) -> bool:
+    events = db.scalars(select(AuditEvent).where(
+        AuditEvent.entity_type == entity_type,
+        AuditEvent.entity_id == str(entity_id),
+        AuditEvent.action.in_(["created", "validated"]),
+    ).order_by(AuditEvent.id)).all()
+    created_for_booking = any(
+        event.action == "created"
+        and json.loads(event.after_json or "{}").get("requires_review") is True
+        for event in events
+    )
+    return created_for_booking and not any(event.action == "validated" for event in events)
 
 
 def estimate_duration_minutes(injection_count: int, gradient_minutes: int) -> int:
@@ -123,6 +138,16 @@ def evaluate_booking(
             results.append(RuleResult(f"{allotment.scope_type}_allotment_exceeded", "approval_required", f"This request exceeds the active {allotment.scope_type} allotment."))
     if override_required:
         results.append(RuleResult("administrator_override", "approval_required", "An administrator override is required."))
+    pending_references = [
+        label for label, item in (("PI", pi), ("project", project))
+        if booking_reference_requires_review(db, label.lower(), item.id)
+    ]
+    if pending_references:
+        results.append(RuleResult(
+            "booking_reference_review",
+            "approval_required",
+            f"The newly created {' and '.join(pending_references)} must be validated by an administrator.",
+        ))
     if not results:
         results.append(RuleResult("allowed", "allowed", "The request satisfies all scheduling rules."))
     order = {"blocked": 0, "approval_required": 1, "allowed": 2}

@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
@@ -51,7 +52,7 @@ from .security import cleanup_login_attempts, cleanup_sessions, create_session, 
 from .services import audit, complete_setup, create_instrument, create_user, replace_block_definitions, reset_user_password, setup_complete
 from .services import get_setting
 from .scheduling import calendar_data, create_maintenance, month_days, prune_expired_holds, prune_expired_tentatives
-from .booking import acquire_hold, clear_wizard_state, release_hold, release_hold_as_admin, resolve_hold, save_wizard_state, slot_values, submit_booking
+from .booking import acquire_hold, clear_wizard_state, create_booking_grant, create_booking_pi, create_booking_project, release_hold, release_hold_as_admin, resolve_hold, save_wizard_state, slot_values, submit_booking
 from .rules import RuleResult, allotment_balances, evaluate_booking, estimate_duration_minutes
 from .management import apply_schedule_draft, cancel_booking, decide_booking, edit_booking, owner_can_manage_booking, preview_outage, preview_resume, recover_unknown_outage, transition_booking
 from .logging_config import configure_logging
@@ -792,12 +793,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 projects = db.scalars(project_query.order_by(Project.code)).all()
                 project_ids = [project.id for project in projects]
                 grants = db.scalars(select(Grant).join(ProjectGrant, ProjectGrant.grant_id == Grant.id).where(Grant.active.is_(True), ProjectGrant.project_id.in_(project_ids)).distinct().order_by(Grant.number)).all() if project_ids else []
+                grant_project_ids: dict[int, list[int]] = {}
+                if project_ids:
+                    for project_id, grant_id in db.execute(select(ProjectGrant.project_id, ProjectGrant.grant_id).where(ProjectGrant.project_id.in_(project_ids))):
+                        grant_project_ids.setdefault(grant_id, []).append(project_id)
                 session_record = db.scalar(select(SessionRecord).where(SessionRecord.token_hash == hash_token(request.cookies.get("instrumenthub_session", ""))))
                 saved = json.loads(session_record.wizard_json) if session_record and session_record.wizard_json else {}
-                values = dict(hold=hold, hold_token=token, instrument_id=entry.instrument_id, slots=slots, reserved_minutes=sum(slot.nominal_minutes for slot in slots), pis=pis, projects=projects, grants=grants, saved=saved, error=error)
+                zone = ZoneInfo(get_setting(db, "timezone", "UTC") or "UTC")
+                start_local, end_local = parse_utc(slots[0].slot_start).astimezone(zone), parse_utc(slots[-1].slot_end).astimezone(zone)
+                start_label = f"{start_local:%a, %b} {start_local.day} · {start_local:%I:%M %p}".replace("· 0", "· ")
+                end_label = f"{end_local:%a, %b} {end_local.day} · {end_local:%I:%M %p %Z}".replace("· 0", "· ")
+                values = dict(hold=hold, hold_token=token, instrument=db.get(Instrument, entry.instrument_id), instrument_id=entry.instrument_id, slots=slots, reserved_minutes=sum(slot.nominal_minutes for slot in slots), reservation_start=start_label, reservation_end=end_label, pis=pis, projects=projects, grants=grants, grant_project_ids=grant_project_ids, saved=saved, error=error)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         return templates.TemplateResponse(request, "booking_form.html", _context(request, **values))
+
+    @app.post("/api/booking-references/{reference_type}")
+    async def booking_reference_create(request: Request, reference_type: str):
+        user = _require_user(request); _check_csrf(request, request.headers.get("X-CSRF-Token", ""))
+        try:
+            payload = await request.json()
+            with database.session() as db:
+                if reference_type == "pi":
+                    item = create_booking_pi(db, user=user, name=str(payload.get("name", "")), email=str(payload.get("email", "")), request_id=request.state.request_id)
+                    result = {"id": item.id, "name": item.name}
+                elif reference_type == "project":
+                    item = create_booking_project(db, user=user, pi_id=int(payload["pi_id"]), code=str(payload.get("code", "")), name=str(payload.get("name", "")), request_id=request.state.request_id)
+                    result = {"id": item.id, "pi_id": item.pi_id, "code": item.code, "name": item.name}
+                elif reference_type == "grant":
+                    item = create_booking_grant(db, user=user, project_id=int(payload["project_id"]), number=str(payload.get("number", "")), name=str(payload.get("name", "")), request_id=request.state.request_id)
+                    result = {"id": item.id, "project_id": int(payload["project_id"]), "number": item.number, "name": item.name}
+                else:
+                    raise HTTPException(404, "Booking reference type not found.")
+        except HTTPException:
+            raise
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return JSONResponse(result, status_code=201)
 
     @app.post("/book/submit")
     def booking_submit(
@@ -817,6 +849,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if not selected_instrument_id:
                     raise ValueError("The selected instrument is unavailable.")
                 token = request.cookies.get(_hold_cookie(selected_instrument_id), "")
+                if override_required and not admin_notes.strip():
+                    raise ValueError("Tell the scheduler why administrator review is needed.")
                 booking, _results = submit_booking(db, hold_id=hold_id, token=token, user=user, pi_id=pi_id, project_id=project_id, grant_id=int(grant_id) if grant_id else None, experiment_code=experiment_code, expected_minutes=int(expected_minutes) if expected_minutes else None, injection_count=int(injection_count) if injection_count else None, gradient_minutes=int(gradient_minutes) if gradient_minutes else None, sample_category=sample_category, description=description, admin_notes=admin_notes, override_required=bool(override_required), request_id=request.state.request_id, expected_instrument_id=selected_instrument_id, column_setup=column_setup, libraries_present=bool(libraries_present), gradient_minutes_value=int(gradient_minutes) if gradient_minutes else None)
                 clear_wizard_state(db, request.cookies.get("instrumenthub_session"))
                 entry_id = booking.calendar_entry_id
@@ -908,11 +942,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return templates.TemplateResponse(request, "booking_edit.html", _context(request, booking=booking, entry=entry, block_count=block_count, schedule_editable=schedule_editable))
 
     @app.post("/bookings/{booking_id}/edit")
-    def booking_edit_submit(request: Request, booking_id: int, csrf_token: Annotated[str, Form()], experiment_code: Annotated[str, Form()], expected_minutes: Annotated[int, Form()], sample_category: Annotated[str, Form()], description: Annotated[str, Form()] = "", admin_notes: Annotated[str, Form()] = "", column_setup: Annotated[str, Form()] = "", libraries_present: Annotated[bool, Form()] = False, gradient_minutes: Annotated[str, Form()] = "", new_start: Annotated[str, Form()] = "", block_count: Annotated[int | None, Form()] = None, reason: Annotated[str, Form()] = ""):
+    def booking_edit_submit(request: Request, booking_id: int, csrf_token: Annotated[str, Form()], experiment_code: Annotated[str, Form()], sample_category: Annotated[str, Form()], expected_minutes: Annotated[str, Form()] = "", description: Annotated[str, Form()] = "", admin_notes: Annotated[str, Form()] = "", column_setup: Annotated[str, Form()] = "", libraries_present: Annotated[bool, Form()] = False, gradient_minutes: Annotated[str, Form()] = "", new_start: Annotated[str, Form()] = "", block_count: Annotated[int | None, Form()] = None, reason: Annotated[str, Form()] = ""):
         actor = _require_user(request); _check_csrf(request, csrf_token)
         try:
             with database.session() as db:
-                edit_booking(db, booking_id=booking_id, actor=actor, experiment_code=experiment_code, expected_minutes=expected_minutes, sample_category=sample_category, description=description, admin_notes=admin_notes, column_setup=column_setup, libraries_present=libraries_present, gradient_minutes=int(gradient_minutes) if gradient_minutes.strip() else None, new_start=new_start.strip() or None, block_count=block_count, reason=reason, request_id=request.state.request_id)
+                edit_booking(db, booking_id=booking_id, actor=actor, experiment_code=experiment_code, expected_minutes=int(expected_minutes) if expected_minutes.strip() else None, sample_category=sample_category, description=description, admin_notes=admin_notes, column_setup=column_setup, libraries_present=libraries_present, gradient_minutes=int(gradient_minutes) if gradient_minutes.strip() else None, new_start=new_start.strip() or None, block_count=block_count, reason=reason, request_id=request.state.request_id)
                 booking = db.get(Booking, booking_id); entry_id = booking.calendar_entry_id
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
