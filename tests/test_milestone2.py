@@ -144,7 +144,7 @@ def test_calendar_icon_assets_and_overview_selection_markup(client, configured):
     assert "cloud-moon.svg" in template
     assert "selection-plus.svg" in page.text
     for name in ("selection-plus.svg", "info.svg", "sun-horizon.svg", "sun-dim.svg", "cloud-moon.svg"):
-        response = client.get(f"/static/images/calendar/{name}")
+        response = client.get(f"/static/icons/{name}")
         assert response.status_code == 200
     assert client.get("/static/microscope.svg").status_code == 200
 

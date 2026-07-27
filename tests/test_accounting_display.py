@@ -59,11 +59,12 @@ def test_admin_accounting_inputs_accept_hours_and_render_hours_days(client, conf
         allotment = db.scalar(select(Allotment).where(Allotment.scope_id == project_id))
         assert allotment.minutes_allowed == 1800
 
-    page = client.get("/admin")
+    page = client.get("/admin?tab=allotments")
     assert 'name="hours_allowed"' in page.text
-    assert "Max consecutive hours" in page.text
     assert "1 day 6 hours" in page.text
     assert "Minutes" not in page.text
+    projects_page = client.get("/admin?tab=projects")
+    assert "Max consecutive hours" in projects_page.text
 
     reports = client.get(f"/admin/reports?start={date.today()}&end={date.today()}")
     assert "Reserved time" in reports.text

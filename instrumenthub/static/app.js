@@ -7,6 +7,17 @@ document.querySelectorAll("[data-confirm]").forEach((element) =>
   })
 );
 
+/* Administration: keep creation controls in place while expanding their editor below. */
+document.querySelectorAll("[data-admin-disclosure-toggle]").forEach((button) => {
+  const panel = document.getElementById(button.getAttribute("aria-controls"));
+  if (!panel) return;
+  button.addEventListener("click", () => {
+    const expanded = button.getAttribute("aria-expanded") === "true";
+    button.setAttribute("aria-expanded", String(!expanded));
+    panel.hidden = expanded;
+  });
+});
+
 /* Hold countdown */
 const hold = document.querySelector("[data-hold-expires]");
 if (hold) {
@@ -288,15 +299,3 @@ if (wizard) {
   syncReviewRequest();
   refresh();
 }
-
-document.querySelectorAll("[data-management-form]").forEach((form) => {
-  form.addEventListener("submit", () => {
-    const user = form.elements.namedItem("user_id");
-    const referenceType = form.elements.namedItem("reference_type");
-    const reference = form.elements.namedItem("reference_id");
-    const instrument = form.elements.namedItem("instrument_id");
-    if (user) form.action = `/admin/users/${encodeURIComponent(user.value)}/role`;
-    if (referenceType && reference) form.action = `/admin/references/${encodeURIComponent(referenceType.value)}/${encodeURIComponent(reference.value)}/status`;
-    if (instrument) form.action = `/admin/instruments/${encodeURIComponent(instrument.value)}/policy`;
-  });
-});

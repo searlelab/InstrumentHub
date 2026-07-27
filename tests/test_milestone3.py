@@ -110,7 +110,7 @@ def test_admin_can_revoke_training_and_immediately_block_booking(client, configu
     assert recorded.status_code == 303
     revoked = client.post("/admin/training/revoke", data={"csrf_token": configured, "user_id": 2, "instrument_id": 1, "reason": "Training withdrawn"}, follow_redirects=False)
     assert revoked.status_code == 303
-    admin = client.get("/admin")
+    admin = client.get("/admin?tab=training")
     assert "Training withdrawn" not in admin.text
     assert "Revoked" in admin.text
     with app.state.database.session() as db:

@@ -58,11 +58,13 @@ from .management import apply_schedule_draft, cancel_booking, decide_booking, ed
 from .logging_config import configure_logging
 from .notifications import mark_read, unread_count
 from .maintenance_tasks import assign_task, complete_task, create_template, generate_due_tasks, schedule_task, set_template_active
+from .ops import create_backup
 from .reporting import csv_safe, usage_report
 from .time_display import accounting_hours_value, format_accounting_duration, parse_accounting_hours
 
 LOGGER = logging.getLogger("instrumenthub")
 PACKAGE_DIR = Path(__file__).parent
+ADMIN_TABS = {"users", "instruments", "projects", "training", "allotments"}
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,15 @@ def _context(request: Request, **values: Any) -> dict[str, Any]:
 
 def _redirect(path: str, status_code: int = 303) -> RedirectResponse:
     return RedirectResponse(path, status_code=status_code)
+
+
+def _admin_tab(value: str | None, fallback: str = "users") -> str:
+    return value if value in ADMIN_TABS else fallback
+
+
+def _admin_redirect(request: Request, message: str, fallback: str = "users") -> RedirectResponse:
+    tab = _admin_tab(request.query_params.get("tab"), fallback)
+    return _redirect(f"/admin?{urlencode({'tab': tab, 'message': message.replace('+', ' ')})}")
 
 
 def _require_user(request: Request) -> RequestUser:
@@ -364,19 +375,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return _redirect("/profile?message=Project+associations+updated")
 
     @app.get("/admin", response_class=HTMLResponse)
-    def admin_dashboard(request: Request, message: str = ""):
+    def admin_dashboard(request: Request, message: str = "", tab: str = "users"):
         _require_admin(request)
+        active_tab = _admin_tab(tab)
         with database.session() as db:
+            pis = db.scalars(select(PI).order_by(PI.name)).all()
+            projects = db.scalars(select(Project).order_by(Project.code)).all()
+            grants = db.scalars(select(Grant).order_by(Grant.number)).all()
             data = {
                 "users": db.scalars(select(User).order_by(User.display_name)).all(),
-                "pis": db.scalars(select(PI).order_by(PI.name)).all(),
+                "pis": pis,
                 "instruments": db.scalars(select(Instrument).order_by(Instrument.name)).all(),
-                "projects": db.scalars(select(Project).order_by(Project.code)).all(),
-                "grants": db.scalars(select(Grant).order_by(Grant.number)).all(),
+                "projects": projects,
+                "grants": grants,
                 "project_grants": db.execute(select(ProjectGrant, Project, Grant).join(Project, Project.id == ProjectGrant.project_id).join(Grant, Grant.id == ProjectGrant.grant_id).order_by(Project.code, Grant.number)).all(),
                 "allotments": db.scalars(select(Allotment).order_by(Allotment.period_start.desc())).all(),
                 "training_records": db.execute(select(InstrumentTraining, User, Instrument).join(User, User.id == InstrumentTraining.user_id).join(Instrument, Instrument.id == InstrumentTraining.instrument_id).order_by(User.display_name, Instrument.name)).all(),
                 "configured": setup_complete(db),
+                "active_tab": active_tab,
+                "allotment_scope_labels": {("pi", item.id): item.name for item in pis} | {("project", item.id): f"{item.code} — {item.name}" for item in projects},
             }
         return templates.TemplateResponse(request, "admin.html", _context(request, message=message, **data))
 
@@ -391,7 +408,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status, str(exc)) from exc
         except IntegrityError as exc:
             raise HTTPException(409, "Username already exists.") from exc
-        return _redirect("/admin?message=User+created")
+        return _admin_redirect(request, "User+created", "users")
 
     @app.post("/admin/users/{user_id}/status")
     def admin_user_status(request: Request, user_id: int, csrf_token: Annotated[str, Form()], active: Annotated[str, Form()], reason: Annotated[str, Form()]):
@@ -407,7 +424,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             before = target.active; target.active = enabled
             if not enabled: revoke_user_sessions(db, target.id)
             audit(db, "status_changed", "user", target.id, actor_user_id=admin.id, reason=reason, before={"active": before}, after={"active": enabled}, request_id=request.state.request_id)
-        return _redirect("/admin?message=User+status+updated")
+        return _admin_redirect(request, "User+status+updated", "users")
 
     @app.post("/admin/users/{user_id}/role")
     def admin_user_role(request: Request, user_id: int, csrf_token: Annotated[str, Form()], role: Annotated[str, Form()], reason: Annotated[str, Form()]):
@@ -421,7 +438,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not target: raise HTTPException(404, "User not found.")
             before = target.role; target.role = role
             audit(db, "role_changed", "user", target.id, actor_user_id=admin.id, reason=reason, before={"role": before}, after={"role": role}, request_id=request.state.request_id)
-        return _redirect("/admin?message=User+role+updated")
+        return _admin_redirect(request, "User+role+updated", "users")
 
     @app.post("/admin/users/{user_id}/password")
     def admin_user_password(
@@ -452,7 +469,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             response = _redirect("/login")
             response.delete_cookie("instrumenthub_session", path="/")
             return response
-        return _redirect("/admin?message=Password+reset+and+sessions+revoked")
+        return _admin_redirect(request, "Password+reset+and+sessions+revoked", "users")
 
     @app.post("/admin/references/{reference_type}/{reference_id}/status")
     def admin_reference_status(request: Request, reference_type: str, reference_id: int, csrf_token: Annotated[str, Form()], active: Annotated[str, Form()], reason: Annotated[str, Form()]):
@@ -465,7 +482,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not target: raise HTTPException(404, "Reference record not found.")
             before = target.active; target.active = active == "true"
             audit(db, "status_changed", reference_type, reference_id, actor_user_id=admin.id, reason=reason, before={"active": before}, after={"active": target.active}, request_id=request.state.request_id)
-        return _redirect("/admin?message=Reference+status+updated")
+        return _admin_redirect(request, "Reference+status+updated", "projects")
 
     @app.post("/admin/instruments/{instrument_id}/policy")
     def admin_instrument_policy(request: Request, instrument_id: int, csrf_token: Annotated[str, Form()], active: Annotated[str, Form()], training_required: Annotated[str, Form()], reason: Annotated[str, Form()]):
@@ -477,7 +494,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             before = {"active": instrument.active, "training_required": instrument.training_required}
             instrument.active, instrument.training_required = active == "true", training_required == "true"
             audit(db, "policy_changed", "instrument", instrument.id, actor_user_id=admin.id, reason=reason, before=before, after={"active": instrument.active, "training_required": instrument.training_required}, request_id=request.state.request_id)
-        return _redirect("/admin?message=Instrument+policy+updated")
+        return _admin_redirect(request, "Instrument+policy+updated", "instruments")
 
     @app.post("/admin/pis")
     def admin_create_pi(request: Request, csrf_token: Annotated[str, Form()], name: Annotated[str, Form()], email: Annotated[str, Form()] = ""):
@@ -487,7 +504,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(400, "PI name is required and must be unique.")
             pi = PI(name=name.strip(), email=email.strip(), active=True); db.add(pi); db.flush()
             audit(db, "created", "pi", pi.id, actor_user_id=admin.id, after={"name": pi.name}, request_id=request.state.request_id)
-        return _redirect("/admin?message=PI+created")
+        return _admin_redirect(request, "PI+created", "projects")
 
     @app.post("/admin/projects")
     def admin_create_project(request: Request, csrf_token: Annotated[str, Form()], pi_id: Annotated[int, Form()], code: Annotated[str, Form()], name: Annotated[str, Form()], max_consecutive_hours: Annotated[str, Form()] = "", max_consecutive_minutes: Annotated[str, Form()] = ""):
@@ -501,7 +518,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(400, "Project PI, code, name, or consecutive-time limit is invalid.")
             project = Project(pi_id=pi_id, code=code.strip(), name=name.strip(), max_consecutive_minutes=limit, active=True); db.add(project); db.flush()
             audit(db, "created", "project", project.id, actor_user_id=admin.id, after={"code": project.code}, request_id=request.state.request_id)
-        return _redirect("/admin?message=Project+created")
+        return _admin_redirect(request, "Project+created", "projects")
 
     @app.post("/admin/grants")
     def admin_create_grant(request: Request, csrf_token: Annotated[str, Form()], pi_id: Annotated[int, Form()], number: Annotated[str, Form()], name: Annotated[str, Form()]):
@@ -511,7 +528,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(400, "Grant PI, number, or name is invalid.")
             grant = Grant(pi_id=pi_id, number=number.strip(), name=name.strip(), active=True); db.add(grant); db.flush()
             audit(db, "created", "grant", grant.id, actor_user_id=admin.id, after={"number": grant.number}, request_id=request.state.request_id)
-        return _redirect("/admin?message=Grant+created")
+        return _admin_redirect(request, "Grant+created", "projects")
 
     @app.post("/admin/project-grants")
     def admin_link_grant(request: Request, csrf_token: Annotated[str, Form()], project_id: Annotated[int, Form()], grant_id: Annotated[int, Form()]):
@@ -522,7 +539,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(400, "Project and grant must exist and belong to the same PI.")
             db.merge(ProjectGrant(project_id=project_id, grant_id=grant_id))
             audit(db, "linked", "project_grant", f"{project_id}:{grant_id}", actor_user_id=admin.id, request_id=request.state.request_id)
-        return _redirect("/admin?message=Grant+linked")
+        return _admin_redirect(request, "Grant+linked", "projects")
 
     @app.post("/admin/project-grants/unlink")
     def admin_unlink_grant(request: Request, csrf_token: Annotated[str, Form()], project_id: Annotated[int, Form()], grant_id: Annotated[int, Form()], reason: Annotated[str, Form()]):
@@ -533,7 +550,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not link: raise HTTPException(404, "Project-grant link not found.")
             db.delete(link)
             audit(db, "unlinked", "project_grant", f"{project_id}:{grant_id}", actor_user_id=admin.id, reason=reason, request_id=request.state.request_id)
-        return _redirect("/admin?message=Grant+unlinked")
+        return _admin_redirect(request, "Grant+unlinked", "projects")
 
     @app.post("/admin/training")
     def admin_training(request: Request, csrf_token: Annotated[str, Form()], user_id: Annotated[int, Form()], instrument_id: Annotated[int, Form()]):
@@ -543,7 +560,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(400, "User and instrument must exist.")
             db.merge(InstrumentTraining(user_id=user_id, instrument_id=instrument_id, trained_at=utc_text(), revoked_at=None))
             audit(db, "granted", "training", f"{user_id}:{instrument_id}", actor_user_id=admin.id, request_id=request.state.request_id)
-        return _redirect("/admin?message=Training+recorded")
+        return _admin_redirect(request, "Training+recorded", "training")
 
     @app.post("/admin/training/revoke")
     def admin_training_revoke(request: Request, csrf_token: Annotated[str, Form()], user_id: Annotated[int, Form()], instrument_id: Annotated[int, Form()], reason: Annotated[str, Form()]):
@@ -556,7 +573,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(404, "Active training record not found.")
             training.revoked_at = utc_text()
             audit(db, "revoked", "training", f"{user_id}:{instrument_id}", actor_user_id=admin.id, reason=reason, before={"revoked_at": None}, after={"revoked_at": training.revoked_at}, request_id=request.state.request_id)
-        return _redirect("/admin?message=Training+revoked")
+        return _admin_redirect(request, "Training+revoked", "training")
 
     @app.post("/admin/allotments")
     def admin_allotment(request: Request, csrf_token: Annotated[str, Form()], scope_type: Annotated[str, Form()], scope_id: Annotated[int, Form()], period_start: Annotated[str, Form()], period_end: Annotated[str, Form()], hours_allowed: Annotated[str, Form()] = "", instrument_id: Annotated[str, Form()] = "", minutes_allowed: Annotated[str, Form()] = ""):
@@ -577,7 +594,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(400, "Allotment scope or instrument does not exist.")
             item = Allotment(scope_type=scope_type, scope_id=scope_id, instrument_id=selected_instrument_id, period_start=period_start, period_end=period_end, minutes_allowed=allotment_minutes); db.add(item); db.flush()
             audit(db, "created", "allotment", item.id, actor_user_id=admin.id, after={"scope_type": scope_type, "scope_id": scope_id, "minutes_allowed": allotment_minutes}, request_id=request.state.request_id)
-        return _redirect("/admin?message=Allotment+created")
+        return _admin_redirect(request, "Allotment+created", "allotments")
 
     @app.post("/admin/allotments/{allotment_id}")
     def admin_update_allotment(request: Request, allotment_id: int, csrf_token: Annotated[str, Form()], period_start: Annotated[str, Form()], period_end: Annotated[str, Form()], hours_allowed: Annotated[str, Form()] = "", reason: Annotated[str, Form()] = "", action: Annotated[str, Form()] = "update", minutes_allowed: Annotated[str, Form()] = ""):
@@ -596,12 +613,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if allotment.period_start > date.today().isoformat():
                     db.delete(allotment)
                     audit(db, "canceled", "allotment", allotment_id, actor_user_id=admin.id, reason=reason, before=before, after={"removed": True}, request_id=request.state.request_id)
-                    return _redirect("/admin?message=Future+allotment+canceled")
+                    return _admin_redirect(request, "Future+allotment+canceled", "allotments")
                 allotment.period_end = min(allotment.period_end, date.today().isoformat())
             else:
                 allotment.period_start, allotment.period_end, allotment.minutes_allowed = period_start, period_end, allotment_minutes
             audit(db, "ended" if action == "end" else "updated", "allotment", allotment.id, actor_user_id=admin.id, reason=reason, before=before, after={"period_start": allotment.period_start, "period_end": allotment.period_end, "minutes_allowed": allotment.minutes_allowed}, request_id=request.state.request_id)
-        return _redirect("/admin?message=Allotment+updated")
+        return _admin_redirect(request, "Allotment+updated", "allotments")
 
     @app.post("/admin/instruments/{instrument_id}/blocks")
     def admin_blocks(request: Request, instrument_id: int, csrf_token: Annotated[str, Form()], effective_from: Annotated[date, Form()], blocks: Annotated[str, Form()]):
@@ -611,7 +628,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 replace_block_definitions(db, instrument_id=instrument_id, effective_from=effective_from, blocks_text=blocks, actor_user_id=admin.id, request_id=request.state.request_id)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        return _redirect("/admin?message=Future+block+version+created")
+        return _admin_redirect(request, "Future+block+version+created", "instruments")
 
     @app.post("/admin/instruments")
     def admin_create_instrument(
@@ -640,7 +657,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        return _redirect("/admin?message=Instrument+created")
+        return _admin_redirect(request, "Instrument+created", "instruments")
 
     def selected_month(value: str) -> tuple[int, int]:
         try:
@@ -1025,7 +1042,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             templates_by_id = {item.id: item for item in db.scalars(select(MaintenanceTemplate)).all()}
             users_by_id = {item.id: item for item in users}
             task_views = [SimpleNamespace(task=task, title=templates_by_id[task.template_id].title if task.template_id in templates_by_id else f"Template {task.template_id}", assignee=users_by_id.get(task.assignee_user_id)) for task in db.scalars(select(MaintenanceTask).where(MaintenanceTask.state == "open").order_by(MaintenanceTask.due_date, MaintenanceTask.id)).all()]
-            values = dict(tentative=tentative, live_holds=live_holds, instruments=db.scalars(select(Instrument).where(Instrument.active.is_(True)).order_by(Instrument.name)).all(), draft_views=draft_views, audits=db.scalars(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(100)).all(), maintenance_templates=list(templates_by_id.values()), maintenance_tasks=task_views, users=users, message=message)
+            values = dict(tentative=tentative, live_holds=live_holds, instruments=db.scalars(select(Instrument).where(Instrument.active.is_(True)).order_by(Instrument.name)).all(), draft_views=draft_views, audits=db.scalars(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(100)).all(), maintenance_templates=list(templates_by_id.values()), maintenance_tasks=task_views, users=users, message=message, active_tab="schedule")
         return templates.TemplateResponse(request, "admin_schedule.html", _context(request, **values))
 
     @app.post("/admin/holds/{hold_id}/release")
@@ -1056,7 +1073,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             users_by_id = {item.id: item for item in users}
             task_views = [SimpleNamespace(task=task, title=templates_by_id[task.template_id].title if task.template_id in templates_by_id else f"Template {task.template_id}", assignee=users_by_id.get(task.assignee_user_id)) for task in db.scalars(select(MaintenanceTask).where(MaintenanceTask.state == "open").order_by(MaintenanceTask.due_date, MaintenanceTask.id)).all()]
             template_views = [SimpleNamespace(template=template, instrument=db.get(Instrument, template.instrument_id)) for template in templates_by_id.values()]
-            values = dict(instruments=db.scalars(select(Instrument).where(Instrument.active.is_(True)).order_by(Instrument.name)).all(), users=users, tasks=task_views, templates=template_views)
+            values = dict(instruments=db.scalars(select(Instrument).where(Instrument.active.is_(True)).order_by(Instrument.name)).all(), users=users, tasks=task_views, templates=template_views, active_tab="maintenance")
         return templates.TemplateResponse(request, "maintenance_tasks.html", _context(request, **values))
 
     @app.post("/admin/bookings/{booking_id}/transition")
@@ -1159,7 +1176,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(400, "End date must be on or after start date.")
         with database.session() as db:
             rows, totals, usage, allotments = usage_report(db, start=start, end=end, grant_id=grant_id, pi_id=pi_id, project_id=project_id, user_id=user_id, instrument_id=instrument_id, state=state)
-            values = dict(rows=rows, totals=totals, usage=usage, allotments=allotments, start=start, end=end, filters={"grant_id": grant_id, "pi_id": pi_id, "project_id": project_id, "user_id": user_id, "instrument_id": instrument_id, "state": state}, grants=db.scalars(select(Grant).order_by(Grant.number)).all(), pis=db.scalars(select(PI).order_by(PI.name)).all(), projects=db.scalars(select(Project).order_by(Project.code)).all(), users=db.scalars(select(User).order_by(User.display_name)).all(), instruments=db.scalars(select(Instrument).order_by(Instrument.name)).all())
+            values = dict(rows=rows, totals=totals, usage=usage, allotments=allotments, start=start, end=end, filters={"grant_id": grant_id, "pi_id": pi_id, "project_id": project_id, "user_id": user_id, "instrument_id": instrument_id, "state": state}, grants=db.scalars(select(Grant).order_by(Grant.number)).all(), pis=db.scalars(select(PI).order_by(PI.name)).all(), projects=db.scalars(select(Project).order_by(Project.code)).all(), users=db.scalars(select(User).order_by(User.display_name)).all(), instruments=db.scalars(select(Instrument).order_by(Instrument.name)).all(), active_tab="reports")
         return templates.TemplateResponse(request, "reports.html", _context(request, **values))
 
     @app.get("/admin/reports.csv")
@@ -1192,12 +1209,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=instrumenthub-usage.csv"})
 
     @app.get("/admin/operations", response_class=HTMLResponse)
-    def operations_page(request: Request):
+    def operations_page(request: Request, message: str = ""):
         _require_admin(request)
         with database.session() as db:
             integrity = db.execute(text("PRAGMA integrity_check")).scalar_one()
             migration_count = db.execute(text("SELECT COUNT(*) FROM schema_migrations")).scalar_one()
         backups = [path.name for path in sorted(settings.backup_dir.glob("*.sqlite3"), key=lambda path: path.stat().st_mtime, reverse=True)[:10]]
-        return templates.TemplateResponse(request, "operations.html", _context(request, integrity=integrity, migration_count=migration_count, backups=backups))
+        return templates.TemplateResponse(request, "operations.html", _context(request, message=message, integrity=integrity, migration_count=migration_count, backups=backups, active_tab="operations"))
+
+    @app.post("/admin/operations/backup")
+    def operations_backup(request: Request, csrf_token: Annotated[str, Form()]):
+        _require_admin(request); _check_csrf(request, csrf_token)
+        try:
+            create_backup(settings)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return _redirect("/admin/operations?message=Backup+created")
 
     return app

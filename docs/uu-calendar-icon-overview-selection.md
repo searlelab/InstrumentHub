@@ -11,7 +11,7 @@ Make calendar blocks visually compact and consistent: replace text affordances w
 - The individual calendar already supports contiguous open-slot selection and submits a normal hold request.
 - The overview currently renders named instrument rows, textual Morning/Evening/Overnight blocks, handler initials, and no selection controls.
 - Status is provided by `calendar_data`; the overview API already refreshes status changes every 15 seconds.
-- The downloaded SVGs are available and will be added under `instrumenthub/static/images/calendar/`.
+- The downloaded SVGs are available under the shared `instrumenthub/static/icons/` directory.
 
 ## Desired direction and scope
 
@@ -23,7 +23,7 @@ Make calendar blocks visually compact and consistent: replace text affordances w
 ## Implementation approach
 
 - First write this plan unchanged to `docs/uu-calendar-icon-overview-selection.md`.
-- Copy the five supplied SVGs to `instrumenthub/static/images/calendar/`, and update the calendar template/CSS to use them as compact, keyboard-accessible controls instead of text arrows and slot labels.
+- Keep the five supplied SVGs in `instrumenthub/static/icons/`, and use them from the calendar template/CSS as compact, keyboard-accessible controls instead of text arrows and slot labels.
 - Refactor calendar selection JavaScript into a shared, instrument-scoped controller usable by both layouts. In the overview, anchor a drag to its initial instrument row, select only that instrument’s contiguous available slots, and submit the selected instrument ID, first slot, and block count through the existing `/book/hold` flow.
 - Add an overview selection bar equivalent to the individual calendar’s bar; clear selection on request and prevent selection gestures from hijacking occupied-entry links.
 - Enrich overview slot markup/data with deterministic instrument accent assignment and tooltip text. Cycle a documented palette for instruments beyond the existing named accent set; hide repetitive instrument labels from day cells while preserving them for assistive technology and hover details.

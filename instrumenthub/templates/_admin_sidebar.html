@@ -1,0 +1,39 @@
+{% set manage_tabs = [
+  {"id": "users", "label": "Users", "hint": "People and access", "icon": "users.svg"},
+  {"id": "instruments", "label": "Instruments", "hint": "Equipment and policy", "icon": "test-tube.svg"},
+  {"id": "projects", "label": "Projects & grants", "hint": "Research references", "icon": "folder-simple.svg"},
+  {"id": "training", "label": "Training", "hint": "Instrument eligibility", "icon": "graduation-cap.svg"},
+  {"id": "allotments", "label": "Allotments", "hint": "Time allowances", "icon": "clock.svg"}
+] %}
+{% set operation_links = [
+  {"href": "/admin/schedule", "id": "schedule", "label": "Approvals & outages", "hint": "Schedule decisions", "icon": "calendar-check.svg"},
+  {"href": "/admin/maintenance-tasks", "id": "maintenance", "label": "Maintenance", "hint": "Recurring work", "icon": "wrench.svg"},
+  {"href": "/admin/reports", "id": "reports", "label": "Usage reports", "hint": "Time and activity", "icon": "chart-line.svg"},
+  {"href": "/admin/operations", "id": "operations", "label": "System status", "hint": "Health and backups", "icon": "gear.svg"}
+] %}
+<aside class="admin-sidebar" aria-label="Administration settings">
+  <div class="admin-sidebar-title">
+    <span class="eyebrow">Workspace</span>
+    <strong>Administration</strong>
+    <span>Manage InstrumentHub</span>
+  </div>
+  <nav class="admin-sidebar-nav" aria-label="Manage">
+    <span class="admin-nav-label">Manage</span>
+    {% for item in manage_tabs %}
+    <a class="admin-nav-link {% if active_tab == item.id %}active{% endif %}" href="/admin?tab={{ item.id }}" {% if active_tab == item.id %}aria-current="page"{% endif %}>
+      <img src="/static/icons/{{ item.icon }}" alt="">
+      <span><strong>{{ item.label }}</strong><small>{{ item.hint }}</small></span>
+    </a>
+    {% endfor %}
+  </nav>
+  <nav class="admin-sidebar-nav" aria-label="Operations">
+    <span class="admin-nav-label">Operations</span>
+    {% for item in operation_links %}
+    <a class="admin-nav-link {% if active_tab == item.id %}active{% endif %}" href="{{ item.href }}" {% if active_tab == item.id %}aria-current="page"{% endif %}>
+      <img src="/static/icons/{{ item.icon }}" alt="">
+      <span><strong>{{ item.label }}</strong><small>{{ item.hint }}</small></span>
+    </a>
+    {% endfor %}
+  </nav>
+  <a class="admin-sidebar-back" href="/calendar"><img src="/static/icons/arrow-left.svg" alt="">Back to calendar</a>
+</aside>
