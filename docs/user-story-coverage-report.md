@@ -27,11 +27,11 @@ The report treats the four dash-prefixed items in the source as distinct stories
 
 ### 1. New lab member booking their first experiment — Covered
 
-**Implemented:** The held-time wizard previews PI/project rules as selections change, including training, availability, one-week, project-consecutive, and PI/project allotment outcomes. It displays remaining and pending allotment time, carries wizard values forward when a hold is lost, and converts an over-limit request to an administrator-reviewed tentative booking rather than confirming it. Server-side evaluation repeats the checks at submission.
+**Implemented:** The held-time wizard previews PI/project rules as selections change, including training, availability, one-week, project-consecutive, and PI/project allotment outcomes. It displays remaining and pending allotment time in hours/days, carries wizard values forward when a hold is lost, and converts an over-limit request to an administrator-reviewed tentative booking rather than confirming it. Server-side evaluation repeats the checks at submission.
 
 **Evidence:** `instrumenthub/rules.py`, `instrumenthub/static/app.js`, `instrumenthub/booking.py`; `tests/test_milestone3.py::test_booking_wizard_has_live_duration_rules_and_allotment_balances`, `::test_lost_hold_returns_to_calendar_and_retains_wizard_fields`, and allotment/rule tests.
 
-**Improve:** Make policy messages more user-oriented (for example, name the affected PI/project and display hours/days as well as minutes). Also make the consequence of a tentative request explicit before submission; the current confirmation path uses the same held-time flow as an immediate confirmation.
+**Improve:** Make policy messages more user-oriented (for example, name the affected PI/project). Also make the consequence of a tentative request explicit before submission; the current confirmation path uses the same held-time flow as an immediate confirmation.
 
 ### 2. Contact the current instrument user during an interruption — Partial
 
@@ -135,7 +135,7 @@ The report treats the four dash-prefixed items in the source as distinct stories
 
 ### 15. PI builds a grant-specific NIH RPPR report — Partial
 
-**Implemented:** Administrator-only reports filter by grant, PI, project, user, instrument, date range, and state. They provide state totals, allotment context, member usage, reservation drill-down, and CSV export with formula-injection protection. Canceled/rejected historic bookings distinguish missing historical reserved-minute snapshots.
+**Implemented:** Administrator-only reports filter by grant, PI, project, user, instrument, date range, and state. They provide state totals, allotment context, member usage, reservation drill-down, and CSV export with formula-injection protection. Accounting values are presented in hours/days, while canceled/rejected historic bookings distinguish missing historical reserved-time snapshots.
 
 **Evidence:** `instrumenthub/reporting.py`, `instrumenthub/templates/reports.html`, `instrumenthub/web.py` report routes; `tests/test_user_story_expansion.py::test_canceled_usage_and_csv_link_keep_the_selected_grant`, `::test_historical_canceled_booking_reports_snapshot_unavailable`, and `::test_csv_formula_cells_are_escaped`.
 
@@ -143,7 +143,7 @@ The report treats the four dash-prefixed items in the source as distinct stories
 
 ### 16. PI investigates instrument monopolization — Partial
 
-**Implemented:** The report can filter by member/instrument/window and shows reserved minutes, longest consecutive minutes, reservation drill-down, and allotment context. Schedule changes and booking actions are auditable.
+**Implemented:** The report can filter by member/instrument/window and shows reserved time, longest consecutive time, reservation drill-down, and allotment context. Schedule changes and booking actions are auditable.
 
 **Evidence:** `instrumenthub/reporting.py`, `instrumenthub/templates/reports.html`, `instrumenthub/services.py` audit service; `tests/test_user_story_expansion.py::test_report_shows_allotment_context_and_longest_consecutive_usage`.
 
@@ -151,7 +151,7 @@ The report treats the four dash-prefixed items in the source as distinct stories
 
 ### 17. PI views lab usage and remaining allotment — Partial
 
-**Implemented:** Allotment calculations distinguish used and tentative minutes and report remaining capacity. Reports can be filtered to PI/project/grant/user and show per-user use and reservation records. A time-limit request becomes tentative for administrator review with the relevant booking context.
+**Implemented:** Allotment calculations distinguish used and tentative time and report remaining capacity in hours/days. Reports can be filtered to PI/project/grant/user and show per-user use and reservation records. A time-limit request becomes tentative for administrator review with the relevant booking context.
 
 **Evidence:** `instrumenthub/rules.py::allotment_balances`, `instrumenthub/reporting.py`, `instrumenthub/templates/reports.html`; `tests/test_milestone3.py::test_allotment_balance_reports_tentative_minutes_as_pending` and `tests/test_user_story_expansion.py::test_report_shows_allotment_context_and_longest_consecutive_usage`.
 

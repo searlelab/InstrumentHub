@@ -74,6 +74,10 @@ def test_canceled_usage_and_csv_link_keep_the_selected_grant(client, configured,
         assert rows[0]["state"] == "canceled" and totals == {"canceled": 120}
     page = client.get(f"/admin/reports?start={date.today()}&end={date.today()}&grant_id={grant_id}")
     assert f"grant_id={grant_id}" in page.text
+    csv = client.get(f"/admin/reports.csv?start={date.today()}&end={date.today()}&grant_id={grant_id}")
+    assert "duration,duration_source" in csv.text
+    assert "2 hours" in csv.text
+    assert "minutes" not in csv.text.lower()
 
 
 def test_historical_canceled_booking_reports_snapshot_unavailable(app, configured):

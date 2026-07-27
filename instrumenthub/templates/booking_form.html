@@ -9,7 +9,7 @@
     </div>
     <h1>{{ instrument.name }}</h1>
     <p class="booking-time">{{ reservation_start }}<br><span>through {{ reservation_end }}</span></p>
-    <p>{{ slots|length }} block{% if slots|length != 1 %}s{% endif %} · {{ reserved_minutes }} reserved minutes</p>
+    <p>{{ slots|length }} block{% if slots|length != 1 %}s{% endif %} · {{ format_duration(reserved_minutes) }} reserved time</p>
     <p class="muted">Your selected blocks define the booking duration. You do not need to estimate run time.</p>
   </aside>
 

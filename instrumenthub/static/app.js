@@ -197,7 +197,7 @@ if (wizard) {
     data.allotment_balances.forEach((balance) => {
       const item = document.createElement("p");
       item.className = "allotment-balance";
-      item.textContent = `${balance.scope_type === "pi" ? "PI" : "Project"} time: ${balance.remaining_minutes} minutes available now; ${balance.remaining_after_request_minutes} after this booking (${balance.pending_minutes} pending).`;
+      item.textContent = `${balance.scope_type === "pi" ? "PI" : "Project"} time: ${balance.remaining_duration} available now; ${balance.remaining_after_request_duration} after this booking (${balance.pending_duration} pending).`;
       preview.append(item);
     });
     submitButton.textContent = data.results.some((result) => result.severity === "approval_required") || reviewToggle.checked

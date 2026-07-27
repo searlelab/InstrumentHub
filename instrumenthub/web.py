@@ -59,6 +59,7 @@ from .logging_config import configure_logging
 from .notifications import mark_read, unread_count
 from .maintenance_tasks import assign_task, complete_task, create_template, generate_due_tasks, schedule_task, set_template_active
 from .reporting import csv_safe, usage_report
+from .time_display import accounting_hours_value, format_accounting_duration, parse_accounting_hours
 
 LOGGER = logging.getLogger("instrumenthub")
 PACKAGE_DIR = Path(__file__).parent
@@ -90,7 +91,15 @@ def _request_user(user: User) -> RequestUser:
 
 
 def _context(request: Request, **values: Any) -> dict[str, Any]:
-    return {"request": request, "user": getattr(request.state, "user", None), "csrf_token": getattr(request.state, "csrf_token", ""), "unread_notifications": getattr(request.state, "unread_notifications", 0), **values}
+    return {
+        "request": request,
+        "user": getattr(request.state, "user", None),
+        "csrf_token": getattr(request.state, "csrf_token", ""),
+        "unread_notifications": getattr(request.state, "unread_notifications", 0),
+        "format_duration": format_accounting_duration,
+        "hours_value": accounting_hours_value,
+        **values,
+    }
 
 
 def _redirect(path: str, status_code: int = 303) -> RedirectResponse:
@@ -481,13 +490,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return _redirect("/admin?message=PI+created")
 
     @app.post("/admin/projects")
-    def admin_create_project(request: Request, csrf_token: Annotated[str, Form()], pi_id: Annotated[int, Form()], code: Annotated[str, Form()], name: Annotated[str, Form()], max_consecutive_minutes: Annotated[str, Form()] = ""):
+    def admin_create_project(request: Request, csrf_token: Annotated[str, Form()], pi_id: Annotated[int, Form()], code: Annotated[str, Form()], name: Annotated[str, Form()], max_consecutive_hours: Annotated[str, Form()] = "", max_consecutive_minutes: Annotated[str, Form()] = ""):
         admin = _require_admin(request); _check_csrf(request, csrf_token)
         with database.session() as db:
             try:
-                limit = int(max_consecutive_minutes) if max_consecutive_minutes else None
-            except ValueError as exc:
-                raise HTTPException(400, "Consecutive-time limit must be a whole number of minutes.") from exc
+                limit = parse_accounting_hours(max_consecutive_hours, label="Consecutive-time limit") if max_consecutive_hours.strip() else (int(max_consecutive_minutes) if max_consecutive_minutes.strip() else None)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, str(exc)) from exc
             if not db.get(PI, pi_id) or not code.strip() or not name.strip() or (limit is not None and limit <= 0) or db.scalar(select(Project.id).where(func.lower(Project.code) == code.strip().lower())):
                 raise HTTPException(400, "Project PI, code, name, or consecutive-time limit is invalid.")
             project = Project(pi_id=pi_id, code=code.strip(), name=name.strip(), max_consecutive_minutes=limit, active=True); db.add(project); db.flush()
@@ -550,9 +559,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return _redirect("/admin?message=Training+revoked")
 
     @app.post("/admin/allotments")
-    def admin_allotment(request: Request, csrf_token: Annotated[str, Form()], scope_type: Annotated[str, Form()], scope_id: Annotated[int, Form()], period_start: Annotated[str, Form()], period_end: Annotated[str, Form()], minutes_allowed: Annotated[int, Form()], instrument_id: Annotated[str, Form()] = ""):
+    def admin_allotment(request: Request, csrf_token: Annotated[str, Form()], scope_type: Annotated[str, Form()], scope_id: Annotated[int, Form()], period_start: Annotated[str, Form()], period_end: Annotated[str, Form()], hours_allowed: Annotated[str, Form()] = "", instrument_id: Annotated[str, Form()] = "", minutes_allowed: Annotated[str, Form()] = ""):
         admin = _require_admin(request); _check_csrf(request, csrf_token)
-        if scope_type not in {"pi", "project"} or minutes_allowed <= 0 or period_end < period_start:
+        try:
+            allotment_minutes = parse_accounting_hours(hours_allowed, label="Allotment") if hours_allowed.strip() else int(minutes_allowed)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if scope_type not in {"pi", "project"} or allotment_minutes <= 0 or period_end < period_start:
             raise HTTPException(400, "Invalid allotment.")
         with database.session() as db:
             target = db.get(PI if scope_type == "pi" else Project, scope_id)
@@ -562,14 +575,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(400, "Instrument selection is invalid.") from exc
             if not target or (selected_instrument_id and not db.get(Instrument, selected_instrument_id)):
                 raise HTTPException(400, "Allotment scope or instrument does not exist.")
-            item = Allotment(scope_type=scope_type, scope_id=scope_id, instrument_id=selected_instrument_id, period_start=period_start, period_end=period_end, minutes_allowed=minutes_allowed); db.add(item); db.flush()
-            audit(db, "created", "allotment", item.id, actor_user_id=admin.id, after={"scope_type": scope_type, "scope_id": scope_id, "minutes_allowed": minutes_allowed}, request_id=request.state.request_id)
+            item = Allotment(scope_type=scope_type, scope_id=scope_id, instrument_id=selected_instrument_id, period_start=period_start, period_end=period_end, minutes_allowed=allotment_minutes); db.add(item); db.flush()
+            audit(db, "created", "allotment", item.id, actor_user_id=admin.id, after={"scope_type": scope_type, "scope_id": scope_id, "minutes_allowed": allotment_minutes}, request_id=request.state.request_id)
         return _redirect("/admin?message=Allotment+created")
 
     @app.post("/admin/allotments/{allotment_id}")
-    def admin_update_allotment(request: Request, allotment_id: int, csrf_token: Annotated[str, Form()], period_start: Annotated[str, Form()], period_end: Annotated[str, Form()], minutes_allowed: Annotated[int, Form()], reason: Annotated[str, Form()], action: Annotated[str, Form()] = "update"):
+    def admin_update_allotment(request: Request, allotment_id: int, csrf_token: Annotated[str, Form()], period_start: Annotated[str, Form()], period_end: Annotated[str, Form()], hours_allowed: Annotated[str, Form()] = "", reason: Annotated[str, Form()] = "", action: Annotated[str, Form()] = "update", minutes_allowed: Annotated[str, Form()] = ""):
         admin = _require_admin(request); _check_csrf(request, csrf_token)
-        if not reason.strip() or action not in {"update", "end"} or (action == "update" and (minutes_allowed <= 0 or period_end < period_start)):
+        try:
+            allotment_minutes = parse_accounting_hours(hours_allowed, label="Allotment") if hours_allowed.strip() else int(minutes_allowed)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if not reason.strip() or action not in {"update", "end"} or (action == "update" and (allotment_minutes <= 0 or period_end < period_start)):
             raise HTTPException(400, "Allotment change is invalid.")
         with database.session() as db:
             allotment = db.get(Allotment, allotment_id)
@@ -582,7 +599,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     return _redirect("/admin?message=Future+allotment+canceled")
                 allotment.period_end = min(allotment.period_end, date.today().isoformat())
             else:
-                allotment.period_start, allotment.period_end, allotment.minutes_allowed = period_start, period_end, minutes_allowed
+                allotment.period_start, allotment.period_end, allotment.minutes_allowed = period_start, period_end, allotment_minutes
             audit(db, "ended" if action == "end" else "updated", "allotment", allotment.id, actor_user_id=admin.id, reason=reason, before=before, after={"period_start": allotment.period_start, "period_end": allotment.period_end, "minutes_allowed": allotment.minutes_allowed}, request_id=request.state.request_id)
         return _redirect("/admin?message=Allotment+updated")
 
@@ -916,7 +933,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 balances = allotment_balances(db, pi=pi, project=project, instrument=instrument, slots=slots, exclude_calendar_entry_id=entry.id) if pi and project and instrument else []
         except ValueError:
             results = [RuleResult("hold_lost", "blocked", "The temporary hold has expired or is no longer valid.")]
-        return {"results": [result.as_dict() for result in results], "reserved_minutes": sum(slot.nominal_minutes for slot in slots) if 'slots' in locals() else 0, "project_consecutive_limit": project.max_consecutive_minutes if 'project' in locals() and project else None, "allotment_balances": balances if 'balances' in locals() else []}
+        reserved_minutes = sum(slot.nominal_minutes for slot in slots) if "slots" in locals() else 0
+        project_limit = project.max_consecutive_minutes if "project" in locals() and project else None
+        balance_views = [
+            {
+                **balance,
+                "consumed_duration": format_accounting_duration(balance["consumed_minutes"]),
+                "pending_duration": format_accounting_duration(balance["pending_minutes"]),
+                "remaining_duration": format_accounting_duration(balance["remaining_minutes"]),
+                "remaining_after_request_duration": format_accounting_duration(balance["remaining_after_request_minutes"]),
+            }
+            for balance in (balances if "balances" in locals() else [])
+        ]
+        return {
+            "results": [result.as_dict() for result in results],
+            "reserved_minutes": reserved_minutes,
+            "reserved_duration": format_accounting_duration(reserved_minutes),
+            "project_consecutive_limit": project_limit,
+            "project_consecutive_limit_duration": format_accounting_duration(project_limit) if project_limit is not None else None,
+            "allotment_balances": balance_views,
+        }
 
     @app.get("/api/duration-estimate")
     def duration_estimate(request: Request, injection_count: int, gradient_minutes: int):
@@ -1131,7 +1167,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _require_admin(request)
         with database.session() as db:
             rows, _totals, _usage, _allotments = usage_report(db, start=start, end=end, grant_id=grant_id, pi_id=pi_id, project_id=project_id, user_id=user_id, instrument_id=instrument_id, state=state)
-        output = io.StringIO(); writer = csv.DictWriter(output, fieldnames=["start", "end", "state", "entry_type", "minutes", "minutes_source", "instrument", "user", "pi", "project", "grant", "experiment"]); writer.writeheader(); writer.writerows([{key: csv_safe(value) for key, value in row.items()} for row in rows])
+        output = io.StringIO()
+        fieldnames = ["start", "end", "state", "entry_type", "duration", "duration_source", "instrument", "user", "pi", "project", "grant", "experiment"]
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        csv_rows = [
+            {
+                "start": row["start"],
+                "end": row["end"],
+                "state": row["state"],
+                "entry_type": row["entry_type"],
+                "duration": format_accounting_duration(row["minutes"]),
+                "duration_source": row["minutes_source"],
+                "instrument": row["instrument"],
+                "user": row["user"],
+                "pi": row["pi"],
+                "project": row["project"],
+                "grant": row["grant"],
+                "experiment": row["experiment"],
+            }
+            for row in rows
+        ]
+        writer.writerows({key: csv_safe(value) for key, value in row.items()} for row in csv_rows)
         return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=instrumenthub-usage.csv"})
 
     @app.get("/admin/operations", response_class=HTMLResponse)

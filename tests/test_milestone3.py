@@ -194,6 +194,7 @@ def test_hold_to_confirmed_booking_and_contact_detail(client, configured, app):
     assert "EXP-1" in detail.text
     assert "member@example.test" in detail.text
     assert "Reserved duration" in detail.text
+    assert "6 hours nominal time" in detail.text
     with app.state.database.session() as db:
         entry = db.scalar(select(CalendarEntry).where(CalendarEntry.title == "EXP-1"))
         assert entry.state == "confirmed"
@@ -494,6 +495,7 @@ def test_booking_wizard_has_live_rules_reference_filters_and_allotment_balances(
     preview = client.post("/api/rules/preview", json={"hold_id": hold_id, "pi_id": pi_id, "project_id": project_id}, headers={"X-CSRF-Token": csrf})
     assert preview.status_code == 200
     assert preview.json()["allotment_balances"][0]["remaining_minutes"] == 1000
+    assert preview.json()["allotment_balances"][0]["remaining_duration"] == "16.67 hours"
 
 
 def test_member_can_quick_create_audited_booking_references(client, configured, app):
