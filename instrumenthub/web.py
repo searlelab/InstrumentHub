@@ -31,9 +31,11 @@ from .models import (
     AuditEvent,
     Booking,
     CalendarEntry,
+    ClassBlockDefinition,
     Grant,
     Hold,
     Instrument,
+    InstrumentClass,
     InstrumentTraining,
     Maintenance,
     PI,
@@ -49,7 +51,7 @@ from .models import (
     MaintenanceTask,
 )
 from .security import cleanup_login_attempts, cleanup_sessions, create_session, hash_token, parse_utc, resolve_session, revoke_user_sessions, utc_text, utcnow, verify_password
-from .services import audit, complete_setup, create_instrument, create_user, replace_block_definitions, reset_user_password, setup_complete
+from .services import audit, complete_setup, create_instrument, create_user, replace_block_definitions, replace_class_block_definitions, reset_user_password, setup_complete
 from .services import get_setting
 from .scheduling import calendar_data, create_maintenance, month_days, prune_expired_holds, prune_expired_tentatives
 from .booking import acquire_hold, clear_wizard_state, create_booking_grant, create_booking_pi, create_booking_project, release_hold, release_hold_as_admin, resolve_hold, save_wizard_state, slot_values, submit_booking
@@ -298,7 +300,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def setup_submit(
         request: Request,
         csrf_token: Annotated[str, Form()], timezone: Annotated[str, Form()],
-        instrument_name: Annotated[str, Form()], instrument_blocks: Annotated[str, Form()],
+        instrument_name: Annotated[str, Form()], instrument_blocks: Annotated[str, Form()] = "",
+        instrument_class_name: Annotated[str, Form()] = "Mass Spectrometer",
         hold_minutes: Annotated[int, Form()] = 15, tentative_expiration_days: Annotated[str, Form()] = "",
         instrument_training: Annotated[str | None, Form()] = None,
     ):
@@ -309,9 +312,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             with database.session() as db:
                 complete_setup(
                     db, timezone=timezone, hold_minutes=hold_minutes, tentative_expiration_days=expiration,
-                    instruments=[
-                        {"name": instrument_name, "blocks": instrument_blocks, "training_required": bool(instrument_training)},
-                    ], actor_user_id=admin.id, request_id=request.state.request_id,
+                    instruments=[{"name": instrument_name, "blocks": instrument_blocks, "training_required": bool(instrument_training)}],
+                    instrument_class_name=instrument_class_name,
+                    actor_user_id=admin.id, request_id=request.state.request_id,
                 )
             return _redirect("/admin")
         except ValueError as exc:
@@ -386,6 +389,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "users": db.scalars(select(User).order_by(User.display_name)).all(),
                 "pis": pis,
                 "instruments": db.scalars(select(Instrument).order_by(Instrument.name)).all(),
+                "instrument_classes": db.scalars(select(InstrumentClass).order_by(InstrumentClass.name)).all(),
+                "class_schedules": {},
                 "projects": projects,
                 "grants": grants,
                 "project_grants": db.execute(select(ProjectGrant, Project, Grant).join(Project, Project.id == ProjectGrant.project_id).join(Grant, Grant.id == ProjectGrant.grant_id).order_by(Project.code, Grant.number)).all(),
@@ -394,6 +399,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "configured": setup_complete(db),
                 "active_tab": active_tab,
                 "allotment_scope_labels": {("pi", item.id): item.name for item in pis} | {("project", item.id): f"{item.code} — {item.name}" for item in projects},
+            }
+            data["class_schedules"] = {
+                instrument_class.id: db.scalars(select(ClassBlockDefinition).where(
+                    ClassBlockDefinition.instrument_class_id == instrument_class.id,
+                    ClassBlockDefinition.effective_from <= date.today().isoformat(),
+                    (ClassBlockDefinition.effective_to.is_(None)) | (ClassBlockDefinition.effective_to >= date.today().isoformat()),
+                ).order_by(ClassBlockDefinition.sort_order)).all()
+                for instrument_class in data["instrument_classes"]
             }
         return templates.TemplateResponse(request, "admin.html", _context(request, message=message, **data))
 
@@ -620,6 +633,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             audit(db, "ended" if action == "end" else "updated", "allotment", allotment.id, actor_user_id=admin.id, reason=reason, before=before, after={"period_start": allotment.period_start, "period_end": allotment.period_end, "minutes_allowed": allotment.minutes_allowed}, request_id=request.state.request_id)
         return _admin_redirect(request, "Allotment+updated", "allotments")
 
+    @app.post("/admin/instrument-classes/{instrument_class_id}/schedule")
+    def admin_class_schedule(request: Request, instrument_class_id: int, csrf_token: Annotated[str, Form()], effective_from: Annotated[date, Form()], blocks: Annotated[str, Form()]):
+        admin = _require_admin(request); _check_csrf(request, csrf_token)
+        try:
+            with database.session() as db:
+                replace_class_block_definitions(db, instrument_class_id=instrument_class_id, effective_from=effective_from, blocks_text=blocks, actor_user_id=admin.id, request_id=request.state.request_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return _admin_redirect(request, "Calendar+structure+updated", "instruments")
+
     @app.post("/admin/instruments/{instrument_id}/blocks")
     def admin_blocks(request: Request, instrument_id: int, csrf_token: Annotated[str, Form()], effective_from: Annotated[date, Form()], blocks: Annotated[str, Form()]):
         admin = _require_admin(request); _check_csrf(request, csrf_token)
@@ -628,14 +651,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 replace_block_definitions(db, instrument_id=instrument_id, effective_from=effective_from, blocks_text=blocks, actor_user_id=admin.id, request_id=request.state.request_id)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        return _admin_redirect(request, "Future+block+version+created", "instruments")
+        return _admin_redirect(request, "Calendar+structure+updated", "instruments")
 
     @app.post("/admin/instruments")
     def admin_create_instrument(
         request: Request,
         csrf_token: Annotated[str, Form()],
         name: Annotated[str, Form()],
-        blocks: Annotated[str, Form()],
+        blocks: Annotated[str, Form()] = "",
         training_required: Annotated[str | None, Form()] = None,
     ):
         admin = _require_admin(request); _check_csrf(request, csrf_token)
@@ -649,7 +672,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 create_instrument(
                     db,
                     name=name,
-                    blocks_text=blocks,
+                    blocks_text=blocks or None,
                     timezone=timezone,
                     training_required=bool(training_required),
                     actor_user_id=admin.id,

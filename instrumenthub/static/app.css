@@ -132,6 +132,7 @@ h1 { font-size: 1.5rem; letter-spacing: .01em; }
 .admin-form-grid button { justify-self: start; }
 .admin-form-grid .checkbox { display: flex; align-items: center; gap: .45rem; }
 .admin-form-grid .checkbox input { width: auto; }
+.admin-form-note { margin: 0; color: var(--slate); font-size: .82rem; }
 .admin-disclosure-toggle { justify-self: end; }
 .admin-disclosure-toggle .disclosure-icon-minus { display: none; }
 .admin-disclosure-toggle[aria-expanded="true"] .disclosure-icon-plus { display: none; }
@@ -151,6 +152,12 @@ h1 { font-size: 1.5rem; letter-spacing: .01em; }
 .admin-schedule-details > summary > span:first-child { display: grid; }
 .admin-schedule-details > summary small { color: var(--slate); font-size: .76rem; font-weight: 500; }
 .admin-schedule-details .admin-disclosure { margin-top: .65rem; }
+.admin-calendar-structure { display: grid; gap: .85rem; }
+.admin-calendar-structure .admin-card-heading { margin-bottom: 0; }
+.admin-calendar-structure .admin-card-heading h3 { margin: 0; color: var(--evergreen); font-size: .98rem; }
+.admin-block-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: .5rem; }
+.admin-block-list > span { display: grid; gap: .12rem; padding: .55rem .65rem; border: 1px solid var(--line); border-radius: var(--radius-sm); background: #fff; }
+.admin-block-list small { color: var(--slate); font-size: .76rem; }
 .admin-table-wrap { overflow-x: auto; }
 .admin-table-wrap table { min-width: 42rem; }
 .admin-table-wrap td, .admin-table-wrap th { vertical-align: top; }

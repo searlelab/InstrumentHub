@@ -9,9 +9,9 @@ from sqlalchemy import and_, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .models import Booking, BlockDefinition, CalendarEntry, Hold, Instrument, Maintenance, ReservedSlot, User
+from .models import Booking, BlockDefinition, CalendarEntry, ClassBlockDefinition, Hold, Instrument, Maintenance, ReservedSlot, User
 from .security import parse_utc, utc_text, utcnow
-from .services import audit, get_setting, require_active_admin
+from .services import audit, class_schedule_for_date, get_setting, require_active_admin
 
 
 @dataclass(frozen=True)
@@ -67,12 +67,31 @@ def slots_from_blocks(blocks: list[tuple[str, str, str]], local_date: date, time
     return slots
 
 
-def slots_for_date(db: Session, instrument_id: int, local_date: date, timezone: str) -> list[Slot]:
-    definitions = db.scalars(select(BlockDefinition).where(
+def _definition_signature(definitions: list[BlockDefinition | ClassBlockDefinition]) -> tuple[tuple[str, str, str], ...]:
+    return tuple((item.name, item.start_time, item.end_time) for item in definitions)
+
+
+def _schedule_definitions(db: Session, instrument_id: int, local_date: date) -> list[BlockDefinition | ClassBlockDefinition]:
+    legacy = db.scalars(select(BlockDefinition).where(
         BlockDefinition.instrument_id == instrument_id,
         BlockDefinition.effective_from <= local_date.isoformat(),
         (BlockDefinition.effective_to.is_(None)) | (BlockDefinition.effective_to >= local_date.isoformat()),
     ).order_by(BlockDefinition.sort_order)).all()
+    instrument = db.get(Instrument, instrument_id)
+    if not instrument or not instrument.instrument_class_id:
+        return legacy
+    class_definitions = class_schedule_for_date(db, instrument.instrument_class_id, local_date)
+    if not class_definitions:
+        return legacy
+    # Keep old per-instrument rows readable for legacy callers that directly
+    # edited them. Normal application writes keep these rows synchronized.
+    if legacy and _definition_signature(legacy) != _definition_signature(class_definitions):
+        return legacy
+    return class_definitions
+
+
+def slots_for_date(db: Session, instrument_id: int, local_date: date, timezone: str) -> list[Slot]:
+    definitions = _schedule_definitions(db, instrument_id, local_date)
     return slots_from_blocks([(item.name, item.start_time, item.end_time) for item in definitions], local_date, timezone)
 
 
@@ -92,19 +111,23 @@ def calendar_slots_for_date(db: Session, instrument_id: int, local_date: date, t
     slots = slots_for_date(db, instrument_id, local_date, timezone)
     if slots:
         return slots
+    instrument = db.get(Instrument, instrument_id)
     first_effective = db.scalar(
-        select(BlockDefinition.effective_from)
-        .where(BlockDefinition.instrument_id == instrument_id)
-        .order_by(BlockDefinition.effective_from)
+        select(ClassBlockDefinition.effective_from)
+        .where(ClassBlockDefinition.instrument_class_id == instrument.instrument_class_id)
+        .order_by(ClassBlockDefinition.effective_from)
         .limit(1)
-    )
+    ) if instrument and instrument.instrument_class_id else None
+    if not first_effective:
+        first_effective = db.scalar(
+            select(BlockDefinition.effective_from)
+            .where(BlockDefinition.instrument_id == instrument_id)
+            .order_by(BlockDefinition.effective_from)
+            .limit(1)
+        )
     if not first_effective or local_date >= date.fromisoformat(first_effective):
         return []
-    definitions = db.scalars(
-        select(BlockDefinition)
-        .where(BlockDefinition.instrument_id == instrument_id, BlockDefinition.effective_from == first_effective)
-        .order_by(BlockDefinition.sort_order)
-    ).all()
+    definitions = _schedule_definitions(db, instrument_id, date.fromisoformat(first_effective))
     return slots_from_blocks([(item.name, item.start_time, item.end_time) for item in definitions], local_date, timezone)
 
 

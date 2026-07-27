@@ -47,7 +47,7 @@ python -m instrumenthub bootstrap-admin
 python -m instrumenthub serve
 ```
 
-Open <http://127.0.0.1:8000>, sign in with the first administrator, and complete the setup flow. Setup establishes the lab timezone, one initial instrument and its fixed booking blocks, hold policy, tentative-expiry policy, and training requirements. Administrators can add further instruments individually later.
+Open <http://127.0.0.1:8000>, sign in with the first administrator, and complete the setup flow. Setup establishes the lab timezone, one initial instrument class and instrument, the shared calendar structure, hold policy, tentative-expiry policy, and training requirements. Administrators can add further instruments to the existing class individually later.
 
 On Windows PowerShell, use:
 

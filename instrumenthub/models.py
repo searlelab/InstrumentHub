@@ -54,10 +54,17 @@ class PI(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class InstrumentClass(Base):
+    __tablename__ = "instrument_classes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String, unique=True)
+
+
 class Instrument(Base):
     __tablename__ = "instruments"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String, unique=True)
+    instrument_class_id: Mapped[Optional[int]] = mapped_column(ForeignKey("instrument_classes.id"), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     training_required: Mapped[bool] = mapped_column(Boolean, default=False)
     unavailable: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -67,6 +74,18 @@ class BlockDefinition(Base):
     __tablename__ = "block_definitions"
     id: Mapped[int] = mapped_column(primary_key=True)
     instrument_id: Mapped[int] = mapped_column(ForeignKey("instruments.id"))
+    name: Mapped[str] = mapped_column(String)
+    start_time: Mapped[str] = mapped_column(String)
+    end_time: Mapped[str] = mapped_column(String)
+    effective_from: Mapped[str] = mapped_column(String)
+    effective_to: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer)
+
+
+class ClassBlockDefinition(Base):
+    __tablename__ = "class_block_definitions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    instrument_class_id: Mapped[int] = mapped_column(ForeignKey("instrument_classes.id"))
     name: Mapped[str] = mapped_column(String)
     start_time: Mapped[str] = mapped_column(String)
     end_time: Mapped[str] = mapped_column(String)

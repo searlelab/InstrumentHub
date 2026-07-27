@@ -17,7 +17,7 @@ from sqlalchemy.exc import OperationalError
 from instrumenthub.db import Database, _apply_migration, run_migrations
 from instrumenthub.__main__ import bootstrap_admin, reset_admin_password
 from instrumenthub.web import create_app
-from instrumenthub.models import AuditEvent, Instrument, SessionRecord, User
+from instrumenthub.models import AuditEvent, ClassBlockDefinition, Instrument, InstrumentClass, SessionRecord, User
 from instrumenthub.scheduling import slots_for_date
 from instrumenthub.security import parse_utc, utc_text, verify_password
 from instrumenthub.services import audit, complete_setup, create_user
@@ -29,7 +29,7 @@ def test_migrations_are_idempotent_and_integrity_is_ok(settings):
     run_migrations(settings.database_path)
     with sqlite3.connect(settings.database_path) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 8
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 9
 
 
 def test_concurrent_first_run_migrations_share_one_fresh_database(tmp_path, monkeypatch):
@@ -51,7 +51,45 @@ def test_concurrent_first_run_migrations_share_one_fresh_database(tmp_path, monk
     assert results == [None, None]
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 8
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 9
+
+
+def test_class_migration_separates_divergent_legacy_instrument_schedules(tmp_path):
+    database_path = tmp_path / "divergent.sqlite3"
+    migration_dir = Path(__file__).parents[1] / "instrumenthub" / "migrations"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
+        for version in range(1, 9):
+            _apply_migration(connection, next(migration_dir.glob(f"{version:03d}_*.sql")))
+        connection.executemany(
+            "INSERT INTO instruments(id,name,active,training_required,unavailable) VALUES (?,?,?,?,?)",
+            [(1, "Orbitrap A", 1, 0, 0), (2, "Orbitrap B", 1, 0, 0)],
+        )
+        connection.executemany(
+            "INSERT INTO block_definitions(id,instrument_id,name,start_time,end_time,effective_from,effective_to,sort_order) VALUES (?,?,?,?,?,?,?,?)",
+            [
+                (1, 1, "Morning", "06:00", "12:00", "2026-01-01", None, 0),
+                (2, 1, "Afternoon", "12:00", "18:00", "2026-01-01", None, 1),
+                (3, 1, "Overnight", "18:00", "06:00", "2026-01-01", None, 2),
+                (4, 2, "Day", "08:00", "20:00", "2026-01-01", None, 0),
+                (5, 2, "Night", "20:00", "08:00", "2026-01-01", None, 1),
+            ],
+        )
+        connection.commit()
+    run_migrations(database_path)
+    with sqlite3.connect(database_path) as connection:
+        assignments = connection.execute("SELECT id, instrument_class_id FROM instruments ORDER BY id").fetchall()
+        assert assignments[0][1] != assignments[1][1]
+        for instrument_id, class_id in assignments:
+            class_blocks = connection.execute(
+                "SELECT name,start_time,end_time FROM class_block_definitions WHERE instrument_class_id=? ORDER BY sort_order",
+                (class_id,),
+            ).fetchall()
+            instrument_blocks = connection.execute(
+                "SELECT name,start_time,end_time FROM block_definitions WHERE instrument_id=? ORDER BY sort_order",
+                (instrument_id,),
+            ).fetchall()
+            assert class_blocks == instrument_blocks
 
 
 def test_utc_text_has_fixed_sortable_microsecond_precision():
@@ -168,6 +206,30 @@ def test_setup_explains_training_and_tentative_expiry(client):
     page = client.get("/setup")
     assert "current training record" in page.text
     assert "automatically cancel unapproved requests" in page.text
+
+
+def test_setup_names_the_initial_class_and_uses_the_standard_schedule_without_block_input(client, app):
+    csrf = login(client)
+    page = client.get("/setup")
+    assert 'name="instrument_class_name"' in page.text
+    assert 'name="instrument_blocks"' not in page.text
+    response = client.post("/setup", data={
+        "csrf_token": csrf,
+        "timezone": "America/Chicago",
+        "instrument_name": "Named class instrument",
+        "instrument_class_name": "Mass Spectrometer",
+        "hold_minutes": "15",
+        "tentative_expiration_days": "",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    with app.state.database.session() as db:
+        instrument_class = db.scalar(select(InstrumentClass).where(InstrumentClass.name == "Mass Spectrometer"))
+        instrument = db.scalar(select(Instrument).where(Instrument.name == "Named class instrument"))
+        definitions = db.scalars(select(ClassBlockDefinition).where(ClassBlockDefinition.instrument_class_id == instrument_class.id).order_by(ClassBlockDefinition.sort_order)).all()
+        assert instrument.instrument_class_id == instrument_class.id
+        assert [(item.name, item.start_time, item.end_time) for item in definitions] == [
+            ("Morning", "06:00", "12:00"), ("Afternoon", "12:00", "18:00"), ("Overnight", "18:00", "06:00")
+        ]
 
 
 def test_instrument_creation_is_unavailable_until_setup(client, app):

@@ -9,11 +9,13 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .models import AppSetting, AuditEvent, BlockDefinition, Booking, CalendarEntry, Instrument, ReservedSlot, User
+from .models import AppSetting, AuditEvent, BlockDefinition, Booking, CalendarEntry, ClassBlockDefinition, Instrument, InstrumentClass, ReservedSlot, User
 from .security import hash_password, parse_utc, revoke_user_sessions, utc_text
 
 SENSITIVE_KEYS = {"password", "password_hash", "token", "token_hash", "csrf", "csrf_token", "secret"}
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]{3,64}$")
+DEFAULT_INSTRUMENT_CLASS = "Mass Spectrometer"
+DEFAULT_MASS_SPECTROMETER_BLOCKS = "Morning,06:00,12:00\nAfternoon,12:00,18:00\nOvernight,18:00,06:00"
 
 
 def sanitize(value: Any) -> Any:
@@ -214,17 +216,73 @@ def parse_blocks(text: str) -> list[tuple[str, str, str]]:
     return sorted(blocks, key=lambda block: (int(block[1][:2]), int(block[1][3:])))
 
 
+def _class_definitions_for_date(db: Session, instrument_class_id: int, local_date: date) -> list[ClassBlockDefinition]:
+    return db.scalars(select(ClassBlockDefinition).where(
+        ClassBlockDefinition.instrument_class_id == instrument_class_id,
+        ClassBlockDefinition.effective_from <= local_date.isoformat(),
+        (ClassBlockDefinition.effective_to.is_(None)) | (ClassBlockDefinition.effective_to >= local_date.isoformat()),
+    ).order_by(ClassBlockDefinition.sort_order)).all()
+
+
+def _definition_signature(definitions: list[BlockDefinition | ClassBlockDefinition]) -> tuple[tuple[str, str, str], ...]:
+    return tuple((item.name, item.start_time, item.end_time) for item in definitions)
+
+
+def instrument_class_for(db: Session, instrument_id: int) -> InstrumentClass | None:
+    instrument = db.get(Instrument, instrument_id)
+    return db.get(InstrumentClass, instrument.instrument_class_id) if instrument and instrument.instrument_class_id else None
+
+
+def class_schedule_for_date(db: Session, instrument_class_id: int, local_date: date) -> list[ClassBlockDefinition]:
+    return _class_definitions_for_date(db, instrument_class_id, local_date)
+
+
+def _ensure_instrument_class(db: Session, name: str) -> InstrumentClass:
+    name = name.strip()
+    if not name:
+        raise ValueError("Instrument class name is required.")
+    existing = db.scalar(select(InstrumentClass).where(func.lower(InstrumentClass.name) == name.lower()))
+    if existing:
+        return existing
+    instrument_class = InstrumentClass(name=name)
+    db.add(instrument_class)
+    db.flush()
+    return instrument_class
+
+
+def _materialize_class_schedule(db: Session, instrument_id: int, instrument_class_id: int) -> None:
+    definitions = db.scalars(select(ClassBlockDefinition).where(
+        ClassBlockDefinition.instrument_class_id == instrument_class_id,
+    ).order_by(ClassBlockDefinition.effective_from, ClassBlockDefinition.sort_order)).all()
+    for item in definitions:
+        db.add(BlockDefinition(
+            instrument_id=instrument_id,
+            name=item.name,
+            start_time=item.start_time,
+            end_time=item.end_time,
+            effective_from=item.effective_from,
+            effective_to=item.effective_to,
+            sort_order=item.sort_order,
+        ))
+
+
+def _class_schedule_blocks(db: Session, instrument_class_id: int, effective_from: date) -> list[tuple[str, str, str]]:
+    definitions = _class_definitions_for_date(db, instrument_class_id, effective_from)
+    return [(item.name, item.start_time, item.end_time) for item in definitions]
+
+
 def create_instrument(
     db: Session,
     *,
     name: str,
-    blocks_text: str,
+    blocks_text: str | None = None,
     timezone: str,
     training_required: bool,
     actor_user_id: int,
+    instrument_class_name: str = DEFAULT_INSTRUMENT_CLASS,
     request_id: str = "",
 ) -> Instrument:
-    """Create one immediately schedulable instrument and its initial block version."""
+    """Create an instrument using its class's shared schedule."""
     require_active_admin(db, actor_user_id)
     name = name.strip()
     if not name:
@@ -233,39 +291,96 @@ def create_instrument(
         raise ValueError("A configured lab timezone is required.")
     if db.scalar(select(Instrument.id).where(func.lower(Instrument.name) == name.lower())):
         raise ValueError("An instrument with that name already exists.")
-    blocks = parse_blocks(blocks_text)
+    instrument_class = _ensure_instrument_class(db, instrument_class_name)
+    blocks = _class_schedule_blocks(db, instrument_class.id, date.today())
+    if not blocks:
+        blocks = parse_blocks(blocks_text or DEFAULT_MASS_SPECTROMETER_BLOCKS)
     from .scheduling import validate_block_boundaries
 
     effective_from = date.today()
     validate_block_boundaries(blocks, timezone=timezone, effective_from=effective_from)
-    instrument = Instrument(name=name, active=True, training_required=training_required, unavailable=False)
+    if not db.scalar(select(ClassBlockDefinition.id).where(ClassBlockDefinition.instrument_class_id == instrument_class.id)):
+        for index, (block_name, start, end) in enumerate(blocks):
+            db.add(ClassBlockDefinition(
+                instrument_class_id=instrument_class.id,
+                name=block_name,
+                start_time=start,
+                end_time=end,
+                effective_from=effective_from.isoformat(),
+                sort_order=index,
+            ))
+        db.flush()
+    instrument = Instrument(name=name, instrument_class_id=instrument_class.id, active=True, training_required=training_required, unavailable=False)
     db.add(instrument)
     try:
         db.flush()
     except IntegrityError as exc:
         raise ValueError("An instrument with that name already exists.") from exc
-    for index, (block_name, start, end) in enumerate(blocks):
-        db.add(BlockDefinition(
-            instrument_id=instrument.id,
-            name=block_name,
-            start_time=start,
-            end_time=end,
-            effective_from=effective_from.isoformat(),
-            sort_order=index,
-        ))
+    _materialize_class_schedule(db, instrument.id, instrument_class.id)
     audit(
         db,
         "created",
         "instrument",
         instrument.id,
         actor_user_id=actor_user_id,
-        after={"name": instrument.name, "training_required": instrument.training_required, "blocks": [item[0] for item in blocks]},
+        after={"name": instrument.name, "instrument_class": instrument_class.name, "training_required": instrument.training_required, "blocks": [item[0] for item in blocks]},
         request_id=request_id,
     )
     return instrument
 
 
+def replace_class_block_definitions(db: Session, *, instrument_class_id: int, effective_from: date, blocks_text: str, actor_user_id: int, request_id: str = "") -> None:
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    require_active_admin(db, actor_user_id)
+    if effective_from <= date.today():
+        raise ValueError("A revised block definition must begin on a future date.")
+    instrument_class = db.get(InstrumentClass, instrument_class_id)
+    if not instrument_class:
+        raise ValueError("Instrument class not found.")
+    instruments = db.scalars(select(Instrument).where(Instrument.instrument_class_id == instrument_class_id).order_by(Instrument.id)).all()
+    if not instruments:
+        raise ValueError("The instrument class has no instruments.")
+    if any(instrument.unavailable for instrument in instruments):
+        raise ValueError("Cannot revise blocks while an unknown outage is unresolved. Resume it or use the outage recovery action first.")
+    blocks = parse_blocks(blocks_text)
+    timezone = get_setting(db, "timezone", "UTC") or "UTC"
+    from .scheduling import slots_from_blocks, validate_block_boundaries
+    validate_block_boundaries(blocks, timezone=timezone, effective_from=effective_from)
+    outgoing = slots_from_blocks(_class_schedule_blocks(db, instrument_class_id, effective_from - timedelta(days=1)), effective_from - timedelta(days=1), timezone)
+    incoming = slots_from_blocks(blocks, effective_from, timezone)
+    if any(previous.start < current.end and current.start < previous.end for previous in outgoing for current in incoming):
+        raise ValueError("The revised block definition overlaps the outgoing version across its effective-date boundary.")
+    future_slots = db.scalars(select(ReservedSlot).join(CalendarEntry, CalendarEntry.id == ReservedSlot.calendar_entry_id).where(
+        ReservedSlot.instrument_id.in_([instrument.id for instrument in instruments]),
+        CalendarEntry.entry_type.in_(["booking", "maintenance", "outage"]),
+        ~CalendarEntry.state.in_(["completed", "canceled", "rejected"]),
+    )).all()
+    blocking = [slot for slot in future_slots if parse_utc(slot.slot_start).astimezone(ZoneInfo(timezone)).date() >= effective_from]
+    if blocking:
+        last_blocked = max(parse_utc(slot.slot_start).astimezone(ZoneInfo(timezone)).date() for slot in blocking)
+        raise ValueError(f"Cannot revise blocks before {last_blocked + timedelta(days=1):%Y-%m-%d}; {len(blocking)} scheduled reservation block(s) would need reconciliation.")
+    latest_effective = db.scalar(select(func.max(ClassBlockDefinition.effective_from)).where(ClassBlockDefinition.instrument_class_id == instrument_class_id))
+    if latest_effective and effective_from.isoformat() <= latest_effective:
+        raise ValueError("A revised block version must begin after every existing version.")
+    cutoff = (effective_from - timedelta(days=1)).isoformat()
+    prior = db.scalars(select(ClassBlockDefinition).where(ClassBlockDefinition.instrument_class_id == instrument_class_id, ClassBlockDefinition.effective_to.is_(None))).all()
+    for definition in prior:
+        definition.effective_to = cutoff
+    for index, (name, start, end) in enumerate(blocks):
+        db.add(ClassBlockDefinition(instrument_class_id=instrument_class_id, name=name, start_time=start, end_time=end, effective_from=effective_from.isoformat(), sort_order=index))
+    for instrument in instruments:
+        legacy_prior = db.scalars(select(BlockDefinition).where(BlockDefinition.instrument_id == instrument.id, BlockDefinition.effective_to.is_(None))).all()
+        for definition in legacy_prior:
+            definition.effective_to = cutoff
+        for index, (name, start, end) in enumerate(blocks):
+            db.add(BlockDefinition(instrument_id=instrument.id, name=name, start_time=start, end_time=end, effective_from=effective_from.isoformat(), sort_order=index))
+    audit(db, "versioned", "instrument_class", instrument_class_id, actor_user_id=actor_user_id, after={"name": instrument_class.name, "effective_from": effective_from.isoformat(), "blocks": [item[0] for item in blocks], "instrument_count": len(instruments)}, request_id=request_id)
+
+
 def replace_block_definitions(db: Session, *, instrument_id: int, effective_from: date, blocks_text: str, actor_user_id: int, request_id: str = "") -> None:
+    """Revise only the named instrument for legacy callers."""
     from datetime import timedelta
     from zoneinfo import ZoneInfo
 
@@ -314,6 +429,7 @@ def complete_setup(
     hold_minutes: int,
     tentative_expiration_days: int | None,
     actor_user_id: int,
+    instrument_class_name: str = DEFAULT_INSTRUMENT_CLASS,
     request_id: str = "",
 ) -> None:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -333,10 +449,11 @@ def complete_setup(
         create_instrument(
             db,
             name=instrument_data["name"],
-            blocks_text=instrument_data["blocks"],
+            blocks_text=instrument_data.get("blocks"),
             timezone=timezone,
             training_required=bool(instrument_data.get("training_required")),
             actor_user_id=actor_user_id,
+            instrument_class_name=instrument_class_name,
             request_id=request_id,
         )
     set_setting(db, "timezone", timezone)
